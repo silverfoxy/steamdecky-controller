@@ -1,0 +1,10 @@
+{
+  "name": "DeckController",
+  "author": "",
+  "flags": [],
+  "publish": {
+    "tags": ["controller", "usbip"],
+    "description": "Share your Steam Deck's physical controller to a Linux PC via USB/IP over Wi-Fi.",
+    "image": ""
+  }
+}
