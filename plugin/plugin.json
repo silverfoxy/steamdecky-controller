@@ -1,10 +1,11 @@
 {
-  "name": "DeckController",
-  "author": "",
+  "name": "SteamDeckyController",
+  "version": "1.0.0",
+  "author": "imsilverfoxy",
   "flags": [],
   "publish": {
-    "tags": ["controller", "usbip"],
-    "description": "Share your Steam Deck's physical controller to a Linux PC via USB/IP over Wi-Fi.",
+    "tags": ["controller", "network", "input"],
+    "description": "Forward your Steam Deck's controller input to a Linux PC over Wi-Fi using evdev/uinput.",
     "image": ""
   }
 }

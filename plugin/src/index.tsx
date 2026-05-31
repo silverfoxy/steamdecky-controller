@@ -1,124 +1,71 @@
-import { callable, definePlugin } from "@decky/api";
-import { ButtonItem, Field, PanelSection, PanelSectionRow, staticClasses } from "@decky/ui";
-import { useEffect, useState } from "react";
+import {
+  definePlugin,
+  ButtonItem,
+  PanelSection,
+  PanelSectionRow,
+  staticClasses,
+  ServerAPI,
+} from "decky-frontend-lib";
+import React, { VFC, useState, useEffect } from "react";
 import { FaGamepad } from "react-icons/fa";
 
-// ── backend callables ────────────────────────────────────────────────────────
+const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
+  const [status, setStatus] = useState("Loading...");
+  const [ip, setIp] = useState("");
+  const [isRunning, setIsRunning] = useState(false);
 
-type Status = { running: boolean; busid: string | null; ip: string };
-type Result = { success: boolean; error?: string; busid?: string; ip?: string };
-type Deps   = { ready: boolean; usbipd: boolean; usbip: boolean; modules: boolean };
-
-const getStatus    = callable<[], Status> ("get_status");
-const startSharing = callable<[], Result> ("start_sharing");
-const stopSharing  = callable<[], Result> ("stop_sharing");
-const checkDeps    = callable<[], Deps>   ("check_deps");
-
-// ── component ────────────────────────────────────────────────────────────────
-
-function Content() {
-  const [running, setRunning] = useState(false);
-  const [ip,      setIp]      = useState("...");
-  const [busid,   setBusid]   = useState<string | null>(null);
-  const [error,   setError]   = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [deps,    setDeps]    = useState<Deps | null>(null);
-
-  const refresh = async () => {
-    const s = await getStatus();
-    setRunning(s.running);
-    setIp(s.ip);
-    setBusid(s.busid);
+  const loadStatus = () => {
+    serverAPI.callPluginMethod("get_status", {})
+      .then((res: any) => {
+        if (res?.success && res?.result) {
+          setIsRunning(res.result.running || false);
+          setIp(res.result.deck_ip || "");
+          setStatus(res.result.running ? "Running" : "Stopped");
+        }
+      })
+      .catch(() => setStatus("Error"));
   };
 
-  useEffect(() => {
-    refresh();
-    checkDeps().then(setDeps);
-    const t = setInterval(refresh, 3000);
-    return () => clearInterval(t);
-  }, []);
+  useEffect(() => { loadStatus(); }, []);
 
-  const handleToggle = async () => {
-    setLoading(true);
-    setError(null);
-    const res = running ? await stopSharing() : await startSharing();
-    if (!res.success) setError(res.error ?? "Unknown error");
-    await refresh();
-    setLoading(false);
+  const handleStart = () => {
+    serverAPI.callPluginMethod("start_sharing", { port: 9090 })
+      .then(() => loadStatus())
+      .catch(() => setStatus("Start failed"));
   };
 
-  const depsReady = deps?.ready ?? true;
+  const handleStop = () => {
+    serverAPI.callPluginMethod("stop_sharing", {})
+      .then(() => loadStatus())
+      .catch(() => setStatus("Stop failed"));
+  };
 
   return (
     <PanelSection title="Controller Sharing">
-
       <PanelSectionRow>
-        <Field label="Status">
-          <span style={{ color: running ? "#4caf50" : "#9e9e9e" }}>
-            {running ? "● Sharing" : "○ Stopped"}
-          </span>
-        </Field>
+        <div>Status: {status}</div>
       </PanelSectionRow>
-
-      <PanelSectionRow>
-        <Field label="Deck IP">{ip}</Field>
-      </PanelSectionRow>
-
-      {running && busid && (
+      {!isRunning && ip && (
         <PanelSectionRow>
-          <Field
-            label="Connect from PC"
-            description={`sudo usbip attach -r ${ip} -b ${busid}`}
-          />
+          <div>Deck IP: {ip}</div>
         </PanelSectionRow>
       )}
-
-      {deps && !depsReady && (
-        <PanelSectionRow>
-          <Field
-            label="⚠ Missing dependencies"
-            description={[
-              !deps.usbipd  && "usbipd not found",
-              !deps.usbip   && "usbip not found",
-              !deps.modules && "kernel modules unavailable",
-            ].filter(Boolean).join(" · ")}
-          />
-        </PanelSectionRow>
-      )}
-
-      {error && (
-        <PanelSectionRow>
-          <Field label="Error" description={error} />
-        </PanelSectionRow>
-      )}
-
       <PanelSectionRow>
         <ButtonItem
           layout="below"
-          onClick={handleToggle}
-          disabled={loading || !depsReady}
+          onClick={isRunning ? handleStop : handleStart}
         >
-          {loading ? "Working…" : running ? "Stop Sharing" : "Start Sharing"}
+          {isRunning ? "Stop" : "Start"}
         </ButtonItem>
       </PanelSectionRow>
-
-      {running && (
-        <PanelSectionRow>
-          <Field
-            label="Note"
-            description="The physical controller is exported to your PC. Steam UI navigation on the Deck won't work while sharing."
-          />
-        </PanelSectionRow>
-      )}
-
     </PanelSection>
   );
-}
+};
 
-// ── plugin entry ─────────────────────────────────────────────────────────────
-
-export default definePlugin(() => ({
-  title:   <div className={staticClasses.Title}>Deck Controller</div>,
-  content: <Content />,
-  icon:    <FaGamepad />,
-}));
+export default definePlugin((serverAPI: ServerAPI) => {
+  return {
+    title: <div className={staticClasses.Title}>Deck Controller</div>,
+    content: <Content serverAPI={serverAPI} />,
+    icon: <FaGamepad />,
+  };
+});

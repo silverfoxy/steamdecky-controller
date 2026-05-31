@@ -1,23 +1,24 @@
 {
-  "name": "deck-controller",
+  "name": "steamdecky-controller",
   "version": "1.0.0",
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w"
   },
   "dependencies": {
-    "@decky/api": "*",
-    "@decky/ui": "*",
+    "decky-frontend-lib": "^3.25.0",
     "react": "^17.0.2",
     "react-dom": "^17.0.2",
     "react-icons": "^4.0.0"
   },
   "devDependencies": {
-    "@rollup/plugin-commonjs": "^25.0.0",
-    "@rollup/plugin-node-resolve": "^15.0.0",
-    "@rollup/plugin-replace": "^5.0.0",
-    "@rollup/plugin-typescript": "^11.0.0",
-    "rollup": "^3.0.0",
+    "@rollup/plugin-commonjs": "^21.1.0",
+    "@rollup/plugin-node-resolve": "^13.3.0",
+    "@rollup/plugin-replace": "^4.0.0",
+    "@rollup/plugin-typescript": "^8.5.0",
+    "@types/react": "^17.0.0",
+    "@types/react-dom": "^17.0.0",
+    "rollup": "^2.79.0",
     "tslib": "^2.0.0",
     "typescript": "^5.0.0"
   }

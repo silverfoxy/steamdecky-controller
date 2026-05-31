@@ -1,26 +1,30 @@
 import asyncio
 import os
-import re
-import signal
 import socket
 import subprocess
+import sys
 import decky_plugin
 
 logger = decky_plugin.logger
 
-USBIPD_PATHS = ["/usr/sbin/usbipd", "/usr/bin/usbipd", "/sbin/usbipd"]
-USBIP_PATHS  = ["/usr/sbin/usbip",  "/usr/bin/usbip",  "/sbin/usbip"]
-VALVE_VID    = "28de"
+# Plugin directory
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Add bundled dependencies to Python path
+LIB_PATH = os.path.join(PLUGIN_DIR, "lib")
+if os.path.exists(LIB_PATH):
+    sys.path.insert(0, LIB_PATH)
+    logger.info(f"Added bundled lib path: {LIB_PATH}")
+else:
+    logger.warning(f"Bundled lib path does not exist: {LIB_PATH}")
+FORWARDER_SCRIPT = os.path.join(PLUGIN_DIR, "controller_forwarder.py")
 
-def _find_bin(paths: list[str]) -> str | None:
-    for p in paths:
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return None
+# Default port for controller events
+DEFAULT_PORT = 9090
 
 
 def _local_ip() -> str:
+    """Get the local IP address of the Steam Deck"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(1)
@@ -32,115 +36,173 @@ def _local_ip() -> str:
         return "unknown"
 
 
-def _find_controller_busid(usbip: str) -> str | None:
-    """Parse `usbip list -l` to find the Valve controller bus ID.
-
-    Output looks like:
-      - busid 3-2 (28de:1205)
-        Valve Software : Steam Deck Controller (28de:1205)
-    """
-    result = subprocess.run([usbip, "list", "-l"], capture_output=True, text=True)
-    for line in result.stdout.splitlines():
-        if VALVE_VID in line.lower():
-            m = re.search(r"busid\s+([\d]+-[\d.]+)", line)
-            if m:
-                return m.group(1)
-    return None
+def _check_evdev() -> bool:
+    """Check if python-evdev is available"""
+    try:
+        logger.info(f"Attempting to import evdev. sys.path: {sys.path[:3]}...")
+        import evdev
+        logger.info(f"✓ evdev imported successfully. Version: {evdev.__version__ if hasattr(evdev, '__version__') else 'unknown'}")
+        logger.info(f"evdev location: {evdev.__file__ if hasattr(evdev, '__file__') else 'unknown'}")
+        return True
+    except ImportError as e:
+        logger.error(f"✗ evdev ImportError: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"✗ Error checking evdev: {e}", exc_info=True)
+        return False
 
 
 class Plugin:
-    _usbipd_proc: subprocess.Popen | None = None
-    _bound_busid: str | None = None
+    _forwarder_proc: subprocess.Popen | None = None
+    _port: int = DEFAULT_PORT
+    _cached_deck_ip: str | None = None
+    _deps_checked: dict | None = None
 
     # ── public API (called from frontend) ────────────────────────────────────
 
     async def check_deps(self) -> dict:
-        usbipd = _find_bin(USBIPD_PATHS)
-        usbip  = _find_bin(USBIP_PATHS)
+        """Check if evdev is available (cached after first call)"""
+        logger.info("=== check_deps called ===")
+        if self._deps_checked is not None:
+            logger.info("Returning cached deps")
+            return self._deps_checked
 
-        modules_ok = True
-        for mod in ("usbip-core", "usbip-host"):
-            r = subprocess.run(["modprobe", "--dry-run", mod], capture_output=True)
-            if r.returncode != 0:
-                modules_ok = False
-                break
+        logger.info("Checking dependencies (not cached)...")
+        evdev_ok = _check_evdev()
+        logger.info(f"evdev check result: {evdev_ok}")
 
-        return {
-            "usbipd":  usbipd is not None,
-            "usbip":   usbip  is not None,
-            "modules": modules_ok,
-            "ready":   usbipd is not None and usbip is not None and modules_ok,
+        forwarder_exists = os.path.exists(FORWARDER_SCRIPT)
+        logger.info(f"forwarder exists: {forwarder_exists}")
+
+        self._deps_checked = {
+            "evdev": evdev_ok,
+            "forwarder": forwarder_exists,
+            "ready": evdev_ok and forwarder_exists,
         }
+        logger.info(f"Dependencies final result: {self._deps_checked}")
+        return self._deps_checked
 
     async def get_status(self) -> dict:
-        running = (
-            self._usbipd_proc is not None
-            and self._usbipd_proc.poll() is None
-        )
-        return {
-            "running": running,
-            "busid":   self._bound_busid,
-            "ip":      _local_ip(),
-        }
+        """Get current sharing status"""
+        try:
+            logger.info("=== get_status called ===")
+            running = (
+                self._forwarder_proc is not None
+                and self._forwarder_proc.poll() is None
+            )
 
-    async def start_sharing(self) -> dict:
-        usbipd = _find_bin(USBIPD_PATHS)
-        usbip  = _find_bin(USBIP_PATHS)
+            # Cache the deck IP to avoid repeated socket connections
+            if self._cached_deck_ip is None:
+                logger.info("Getting deck IP...")
+                self._cached_deck_ip = _local_ip()
+                logger.info(f"Detected deck IP: {self._cached_deck_ip}")
 
-        if not usbipd or not usbip:
-            return {"success": False, "error": "usbipd/usbip not found — see README"}
+            result = {
+                "running": running,
+                "port": self._port,
+                "deck_ip": self._cached_deck_ip,
+            }
+            logger.info(f"Returning status: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error in get_status: {e}", exc_info=True)
+            return {"running": False, "port": self._port, "deck_ip": "error"}
+
+    async def start_sharing(self, port: int = DEFAULT_PORT) -> dict:
+        """Start forwarding controller events (Deck runs server)"""
+        logger.info(f"========== start_sharing called with port={port} ==========")
+
+        # Check if already running
+        if self._forwarder_proc is not None and self._forwarder_proc.poll() is None:
+            logger.warning("Cannot start: already running")
+            return {"success": False, "error": "Already running"}
+
+        # Check dependencies inline
+        logger.info("Checking dependencies...")
+        evdev_ok = _check_evdev()
+        logger.info(f"evdev available: {evdev_ok}")
+
+        forwarder_exists = os.path.exists(FORWARDER_SCRIPT)
+        logger.info(f"forwarder exists: {forwarder_exists}")
+
+        if not evdev_ok:
+            error_msg = "Missing: python-evdev"
+            logger.error(f"Cannot start: {error_msg}")
+            return {"success": False, "error": error_msg}
+
+        if not forwarder_exists:
+            error_msg = "Missing: controller_forwarder.py"
+            logger.error(f"Cannot start: {error_msg}")
+            return {"success": False, "error": error_msg}
 
         try:
-            for mod in ("usbip-core", "usbip-host"):
-                subprocess.run(["modprobe", mod], check=True, capture_output=True)
+            # Start the forwarder server process using system Python
+            # Note: sys.executable is the PyInstaller frozen Decky binary, not a Python interpreter
+            # We need system Python to use evdev (same approach as decktation plugin)
+            python_bin = "/usr/bin/python3"
+            if not os.path.exists(python_bin):
+                # Fallback to finding python3 in PATH
+                import shutil
+                python_bin = shutil.which("python3")
+                if not python_bin:
+                    logger.error("No python3 found in system")
+                    return {"success": False, "error": "System Python not found"}
 
-            busid = _find_controller_busid(usbip)
-            if not busid:
-                return {"success": False, "error": "Valve controller not found on USB bus"}
+            logger.info(f"Starting controller forwarder server on port {port}")
+            logger.info(f"Using system Python: {python_bin}")
+            logger.info(f"Forwarder script: {FORWARDER_SCRIPT}")
 
-            r = subprocess.run([usbip, "bind", "-b", busid], capture_output=True, text=True)
-            if r.returncode != 0 and "already bound" not in r.stderr:
-                return {"success": False, "error": f"bind failed: {r.stderr.strip()}"}
+            # Start forwarder with system Python (not Decky's bundled Python)
+            self._forwarder_proc = subprocess.Popen(
+                [python_bin, FORWARDER_SCRIPT, "-p", str(port)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            logger.info(f"Subprocess created with PID: {self._forwarder_proc.pid}")
 
-            self._bound_busid = busid
+            # Wait a moment to check if it started successfully
+            await asyncio.sleep(0.5)
 
-            if self._usbipd_proc is None or self._usbipd_proc.poll() is not None:
-                self._usbipd_proc = subprocess.Popen(
-                    [usbipd],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+            poll_result = self._forwarder_proc.poll()
+            logger.info(f"After 0.5s, process poll result: {poll_result}")
 
-            logger.info(f"Sharing controller busid={busid} ip={_local_ip()}")
-            return {"success": True, "busid": busid, "ip": _local_ip()}
+            if poll_result is not None:
+                # Process exited immediately, something went wrong
+                logger.error(f"Forwarder exited with code: {poll_result}")
+                return {"success": False, "error": "Forwarder failed to start. Check system logs."}
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"start_sharing: {e}")
-            return {"success": False, "error": str(e)}
+            self._port = port
+
+            logger.info(f"✓ Controller forwarder started successfully on port {port}")
+            return {
+                "success": True,
+                "port": port,
+                "deck_ip": _local_ip()
+            }
+
         except Exception as e:
-            logger.error(f"start_sharing: {e}")
+            logger.error(f"start_sharing exception: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     async def stop_sharing(self) -> dict:
-        usbip = _find_bin(USBIP_PATHS)
+        """Stop forwarding controller events"""
         try:
-            if usbip and self._bound_busid:
-                subprocess.run([usbip, "unbind", "-b", self._bound_busid], capture_output=True)
-                self._bound_busid = None
-
-            if self._usbipd_proc is not None:
-                self._usbipd_proc.terminate()
+            if self._forwarder_proc is not None:
+                logger.info("Stopping controller forwarder")
+                self._forwarder_proc.terminate()
                 try:
-                    self._usbipd_proc.wait(timeout=3)
+                    self._forwarder_proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    self._usbipd_proc.kill()
-                self._usbipd_proc = None
+                    logger.warning("Forwarder didn't stop gracefully, killing")
+                    self._forwarder_proc.kill()
+                self._forwarder_proc = None
 
             logger.info("Controller sharing stopped")
             return {"success": True}
 
         except Exception as e:
-            logger.error(f"stop_sharing: {e}")
+            logger.error(f"stop_sharing error: {e}")
             return {"success": False, "error": str(e)}
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
@@ -150,4 +212,10 @@ class Plugin:
 
     async def _unload(self):
         logger.info("DeckController plugin unloading")
-        await self.stop_sharing()
+        # Stop forwarder if running
+        if self._forwarder_proc is not None:
+            try:
+                self._forwarder_proc.terminate()
+                self._forwarder_proc.wait(timeout=3)
+            except:
+                pass
