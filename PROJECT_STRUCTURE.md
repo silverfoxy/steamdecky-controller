@@ -1,215 +1,176 @@
-# Steam Deck Controller Forwarder - Project Structure
+# Project Structure
 
 ## Overview
 
-This project enables forwarding Steam Deck controller input to a Linux PC over Wi-Fi using evdev/uinput.
+This project shares the Steam Deck's built-in controller to a PC over the network using USB/IP.
 
 ## Directory Structure
 
 ```
 steamdecky-controller/
-├── plugin/                      # Decky Loader plugin (Deck side)
-│   ├── src/
-│   │   └── index.tsx           # Frontend UI
-│   ├── dist/                   # Built frontend (generated)
-│   ├── main.py                 # Backend plugin logic
-│   ├── controller_forwarder.py # Reads evdev, forwards events over UDP
-│   ├── plugin.json             # Plugin metadata
-│   ├── package.json            # Node dependencies
-│   ├── rollup.config.js        # Build configuration
-│   ├── tsconfig.json           # TypeScript config
-│   ├── build.sh                # Build frontend only
-│   ├── copy.sh                 # Copy to Decky (no build)
-│   ├── deploy.sh               # Build + deploy to Decky
-│   ├── README.md               # Main plugin documentation
-│   ├── DEVELOPMENT_LOG.md      # Development history & decisions
-│   ├── TESTING_GUIDE.md        # Testing instructions
-│   └── legacy-usbip/           # Old USB/IP approach (deprecated)
+├── README.md                    # Main documentation - how to use USB/IP solution
+├── JOURNEY.md                   # Development story and lessons learned
+├── PROJECT_STRUCTURE.md         # This file
 │
-├── pc-client/                   # PC side client
-│   ├── pc_client.py            # Receives events, creates virtual controller
-│   ├── setup.sh                # One-time PC setup script
-│   ├── README.md               # PC client documentation
-│   ├── connect-usbip.sh.old    # Old USB/IP script (deprecated)
-│   └── disconnect-usbip.sh.old # Old USB/IP script (deprecated)
+├── deck-start-usbip.sh         # Start sharing controller from Deck
+├── deck-stop-usbip.sh          # Stop sharing controller
 │
-└── PROJECT_STRUCTURE.md         # This file
+├── pc-scripts/                 # Scripts for PC to connect to Deck
+│   ├── pc-connect.sh           # Connect to shared controller
+│   └── pc-disconnect.sh        # Disconnect from controller
+│
+└── archive/                    # Previous approaches (archived)
+    ├── README.md               # What's in the archive and why
+    ├── decky-plugin-attempt/   # Decky Loader plugin approach
+    │   ├── plugin/             # Plugin code
+    │   └── pc-client/          # Original PC client
+    └── experiments/            # Testing and discovery scripts
 ```
 
-## Key Files
+## Current Solution: USB/IP
 
-### Deck Side (Plugin)
+The active codebase uses Linux kernel's USB/IP functionality to share the Steam Deck controller as a USB device over the network.
 
-| File | Purpose |
-|------|---------|
-| `main.py` | Plugin backend - manages forwarder process |
-| `controller_forwarder.py` | Reads evdev events, forwards via UDP |
-| `src/index.tsx` | React frontend UI |
-| `dist/index.js` | Built frontend (IIFE format) |
-| `plugin.json` | Plugin metadata for Decky |
-
-### PC Side (Client)
+### Deck Scripts
 
 | File | Purpose |
 |------|---------|
-| `pc_client.py` | Receives UDP events, creates virtual uinput device |
-| `setup.sh` | Installs python3-uinput, configures uinput module |
-| `README.md` | PC setup & troubleshooting guide |
+| `deck-start-usbip.sh` | Export and share the controller via USB/IP |
+| `deck-stop-usbip.sh` | Stop sharing and rebind controller to local system |
+
+### PC Scripts
+
+| File | Purpose |
+|------|---------|
+| `pc-scripts/pc-connect.sh` | Attach to remote controller from PC |
+| `pc-scripts/pc-disconnect.sh` | Detach from controller |
 
 ### Documentation
 
 | File | Purpose |
 |------|---------|
-| `plugin/README.md` | Main plugin documentation |
-| `plugin/DEVELOPMENT_LOG.md` | Full development history, design decisions |
-| `plugin/TESTING_GUIDE.md` | Quick testing guide |
-| `pc-client/README.md` | PC client setup & usage |
+| `README.md` | User-facing documentation, quick start guide |
+| `JOURNEY.md` | Developer documentation, approaches tried, lessons learned |
 | `PROJECT_STRUCTURE.md` | This file - project overview |
+| `archive/README.md` | Explanation of archived code |
 
-### Build Scripts
+## How It Works
 
-| Script | Purpose |
-|--------|---------|
-| `build.sh` | Build frontend only (`npm run build`) |
-| `copy.sh` | Copy files to Decky without building |
-| `deploy.sh` | Build + copy to Decky (recommended) |
+USB/IP is a Linux kernel feature that allows USB devices to be shared over a network.
 
-## Workflow
-
-### Development
-
-1. **Edit code** in `plugin/src/` or `plugin/main.py`
-2. **Build**: `cd plugin && ./build.sh`
-3. **Deploy**: `./deploy.sh`
-4. **Restart Decky Loader** to reload plugin
-
-### Testing
-
-1. **PC**: Run `cd pc-client && python3 pc_client.py`
-2. **Deck**: Open plugin, enter PC IP, click "Start Sharing"
-3. **Test**: Press buttons on Deck, verify on PC
-
-## Technology Stack
-
-### Deck Side
-- **Python 3** (plugin backend)
-- **python-evdev** (reading controller events)
-- **React + TypeScript** (frontend UI)
-- **Rollup 2.x** (bundler, IIFE output)
-- **Decky Frontend Lib** (UI components)
-
-### PC Side
-- **Python 3** (client)
-- **python-uinput** (virtual device creation)
-- **Linux uinput module** (kernel virtual input)
-
-### Network
-- **UDP** (event transport, port 9090)
-- **Custom protocol** (8-byte event packets)
-
-## Architecture
+### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                      Steam Deck                         │
-│                                                         │
-│  ┌──────────────┐         ┌──────────────────┐        │
-│  │   Physical   │  evdev  │  controller_     │        │
-│  │  Controller  ├────────→│  forwarder.py    │        │
-│  │              │         │                  │        │
-│  └──────────────┘         └─────────┬────────┘        │
-│                                     │                  │
-│  ┌──────────────┐                  │ UDP              │
-│  │ Decky Plugin │                  │ (events)         │
-│  │  (manages)   ├──────────────────┘                  │
-│  └──────────────┘                                     │
-└─────────────────────────────┬───────────────────────────┘
-                              │
-                              │ Network (WiFi)
-                              │
-┌─────────────────────────────┴───────────────────────────┐
-│                        Linux PC                         │
-│                                                         │
-│  ┌──────────────────┐       ┌──────────────────┐      │
-│  │  pc_client.py    │       │    Virtual       │      │
-│  │  (receives UDP)  ├──────→│   Controller     │      │
-│  │                  │ uinput│   /dev/input/*   │      │
-│  └──────────────────┘       └────────┬─────────┘      │
-│                                       │                │
-│                              ┌────────┴─────────┐     │
-│                              │   Games/Apps     │     │
-│                              └──────────────────┘     │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│                  Steam Deck                      │
+│                                                  │
+│  ┌──────────────┐       ┌────────────────┐     │
+│  │  Controller  │──USB──│  usbipd        │     │
+│  │  (28de:1205) │       │  (exports USB) │─────┼──┐
+│  └──────────────┘       └────────────────┘     │  │
+│                                                  │  │
+└──────────────────────────────────────────────────┘  │
+                                                      │
+                                           Network/TCP│
+                                                      │
+┌──────────────────────────────────────────────────┐  │
+│                   PC (Linux)                     │  │
+│                                                  │  │
+│  ┌────────────────┐     ┌──────────────────┐   │  │
+│  │  vhci-hcd      │◄────│  usbip attach    │◄──┼──┘
+│  │  (USB device)  │     │  (client)        │   │
+│  └────────┬───────┘     └──────────────────┘   │
+│           │                                     │
+│           ▼                                     │
+│  ┌────────────────┐                            │
+│  │  Games/Apps    │                            │
+│  │  (sees real    │                            │
+│  │   USB device)  │                            │
+│  └────────────────┘                            │
+└──────────────────────────────────────────────────┘
 ```
 
-## Event Flow
+### Workflow
 
-1. User presses button on Steam Deck
-2. Linux kernel generates evdev event → `/dev/input/eventX`
-3. `controller_forwarder.py` reads event
-4. Packs into 8 bytes: `[type:u16, code:u16, value:i32]`
-5. Sends via UDP to PC IP:9090
-6. `pc_client.py` receives packet
-7. Unpacks event
-8. Injects into virtual uinput device
-9. PC games/apps see it as real controller input
+**On Deck:**
+1. `deck-start-usbip.sh` finds controller (busid 3-3)
+2. Unbinds from local USB driver
+3. Starts `usbipd` daemon to share over network
+4. Controller is exported but not locally available
 
-## Port Information
+**On PC:**
+1. `pc-connect.sh <deck-ip>` loads `vhci-hcd` module
+2. Attaches to remote USB device via TCP
+3. Controller appears as `/dev/input/eventX`
+4. Games see it as a native USB controller
 
-- **Default**: UDP port 9090
-- **Configurable** in plugin UI
-- **Firewall**: Must allow incoming UDP on PC
+**Test Mode (Loopback):**
+- Attach to 127.0.0.1 on the Deck itself
+- Controller re-appears via USB/IP tunnel
+- Validates setup before PC testing
 
-## Dependencies
+## Requirements
 
-### Deck (Pre-installed on SteamOS)
-- python-evdev
-- Python 3.10+
+### Steam Deck
+- **USB/IP tools:** `nix profile install nixpkgs#linuxPackages.usbip`
+- **Kernel modules:** `usbip-core`, `usbip-host` (auto-loaded by script)
+- **Permissions:** sudo/root access
 
-### PC (Requires installation)
-- python3-uinput
-- uinput kernel module
-- Python 3.6+
+### PC
+- **USB/IP tools:**
+  - Ubuntu/Debian: `sudo apt install linux-tools-generic`
+  - Fedora: `sudo dnf install usbip`
+  - Arch: `sudo pacman -S usbip`
+- **Kernel module:** `vhci-hcd` (auto-loaded by script)
+- **Permissions:** sudo/root access
 
-## Build Output
+## Usage
 
-After `npm run build`:
-- `dist/index.js` - IIFE bundle (not ES module)
-- Includes React, UI components
-- Externals: react, react-dom, decky-frontend-lib (provided by Decky)
+### On Deck
+```bash
+./deck-start-usbip.sh    # Start sharing
+./deck-stop-usbip.sh     # Stop sharing
+```
 
-## Deployment Target
+### On PC
+```bash
+cd pc-scripts
+./pc-connect.sh 192.168.1.206     # Connect to Deck
+./pc-disconnect.sh                # Disconnect
+```
 
-- **Path**: `~/homebrew/plugins/steamdecky-controller/`
-- **Required files**:
-  - `main.py`
-  - `controller_forwarder.py`
-  - `plugin.json`
-  - `package.json`
-  - `dist/index.js`
+### Test Mode
+```bash
+# On Deck only:
+./deck-start-usbip.sh
+sudo modprobe vhci-hcd
+sudo ~/.nix-profile/bin/usbip attach -r 127.0.0.1 -b 3-3
+# Controller should still work on Deck!
+```
 
-## Version History
+## Archive
 
-- **v1.0** - Initial USB/IP approach (deprecated)
-- **v2.0** - Evdev/uinput approach (current)
+Previous approaches (evdev, Decky plugin) are preserved in `archive/` for:
+- Historical reference
+- Learning from what didn't work
+- Potential code reuse for other projects
 
-## Future Ideas
+See [JOURNEY.md](JOURNEY.md) for the full development story.
 
-- Auto-discover PC on network (mDNS/Bonjour)
-- Multiple controller support
-- Latency monitoring
-- Compression for high-frequency events
-- Encryption for events
-- Web-based PC client (no Python required)
-- Binary distribution for PC client
+## Key Insights
 
-## Contributing
+**Why USB/IP won:**
+- Works at kernel level (no permission issues)
+- Doesn't conflict with Steam Input
+- Native USB device on PC (no virtual device needed)
+- Minimal latency over LAN
+- Standard Linux tooling
 
-When modifying:
-1. Update relevant documentation
-2. Test on both Deck and PC
-3. Update DEVELOPMENT_LOG.md with significant changes
-4. Keep legacy files in `legacy-usbip/` for reference
+**What we learned:**
+- The controller is just a USB device (VID:28de PID:1205)
+- `usbip list -l` shows correct busid format (not lsusb)
+- Test locally first with loopback (127.0.0.1)
+- Nix + sudo PATH issues solved with full paths
 
 ## License
 

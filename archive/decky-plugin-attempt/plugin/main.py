@@ -57,6 +57,8 @@ class Plugin:
     _port: int = DEFAULT_PORT
     _cached_deck_ip: str | None = None
     _deps_checked: dict | None = None
+    _mode: str = "evdev"  # "evdev" or "usbip"
+    _usbip_busid: str | None = None
 
     # ── public API (called from frontend) ────────────────────────────────────
 
@@ -97,16 +99,31 @@ class Plugin:
                 self._cached_deck_ip = _local_ip()
                 logger.info(f"Detected deck IP: {self._cached_deck_ip}")
 
+            # Check for connected client
+            client_ip = None
+            status_file = "/tmp/deck_controller_status.txt"
+            try:
+                if os.path.exists(status_file):
+                    with open(status_file, 'r') as f:
+                        status_content = f.read().strip()
+                        if status_content.startswith("connected:"):
+                            client_ip = status_content.split(":", 1)[1]
+            except Exception as e:
+                logger.warning(f"Could not read status file: {e}")
+
             result = {
                 "running": running,
                 "port": self._port,
                 "deck_ip": self._cached_deck_ip,
+                "client_ip": client_ip,
+                "mode": self._mode,
+                "usbip_info": self._usbip_busid if self._mode == "usbip" else "",
             }
             logger.info(f"Returning status: {result}")
             return result
         except Exception as e:
             logger.error(f"Error in get_status: {e}", exc_info=True)
-            return {"running": False, "port": self._port, "deck_ip": "error"}
+            return {"running": False, "port": self._port, "deck_ip": "error", "client_ip": None}
 
     async def start_sharing(self, port: int = DEFAULT_PORT) -> dict:
         """Start forwarding controller events (Deck runs server)"""
@@ -199,10 +216,100 @@ class Plugin:
                 self._forwarder_proc = None
 
             logger.info("Controller sharing stopped")
+            self._mode = "evdev"
             return {"success": True}
 
         except Exception as e:
             logger.error(f"stop_sharing error: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def start_usbip(self, port: int = DEFAULT_PORT) -> dict:
+        """Start USB/IP controller sharing"""
+        logger.info("========== start_usbip called ==========")
+
+        if self._forwarder_proc is not None:
+            return {"success": False, "error": "Already running in evdev mode"}
+
+        try:
+            # Run the USB/IP start script
+            logger.info("Starting USB/IP export...")
+
+            result = subprocess.run(
+                ["/bin/bash", "-c", """
+                    # Find Steam Deck controller
+                    DEVICE_INFO=$(lsusb | grep -i "valve\\|steam")
+                    if [ -z "$DEVICE_INFO" ]; then
+                        echo "ERROR: Controller not found"
+                        exit 1
+                    fi
+
+                    # Extract bus ID
+                    BUS_ID=$(echo "$DEVICE_INFO" | awk '{print $2}' | sed 's/^0*//')
+                    DEV_ID=$(echo "$DEVICE_INFO" | awk '{print $4}' | sed 's/://g' | sed 's/^0*//')
+                    BUSID="${BUS_ID}-${DEV_ID}"
+
+                    # Load modules and start daemon
+                    modprobe usbip-core 2>/dev/null
+                    modprobe usbip-host 2>/dev/null
+                    killall usbipd 2>/dev/null
+                    usbipd -D
+                    sleep 0.5
+
+                    # Bind device
+                    usbip bind -b "$BUSID" 2>&1
+
+                    # Output busid for the plugin
+                    echo "$BUSID"
+                """],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                busid = result.stdout.strip().split('\n')[-1]  # Last line is busid
+                self._usbip_busid = busid
+                self._mode = "usbip"
+                logger.info(f"✓ USB/IP started, busid: {busid}")
+                return {
+                    "success": True,
+                    "busid": busid,
+                    "deck_ip": _local_ip()
+                }
+            else:
+                error_msg = result.stderr or "Failed to start USB/IP"
+                logger.error(f"USB/IP failed: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            logger.error(f"start_usbip exception: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    async def stop_usbip(self) -> dict:
+        """Stop USB/IP controller sharing"""
+        try:
+            logger.info("Stopping USB/IP...")
+
+            result = subprocess.run(
+                ["/bin/bash", "-c", """
+                    # Unbind all devices
+                    usbip list -l 2>/dev/null | grep "busid" | awk '{print $2}' | while read BUSID; do
+                        usbip unbind -b "$BUSID" 2>&1
+                    done
+
+                    # Stop daemon
+                    killall usbipd 2>/dev/null
+                """],
+                capture_output=True,
+                text=True
+            )
+
+            self._usbip_busid = None
+            self._mode = "evdev"
+            logger.info("✓ USB/IP stopped")
+            return {"success": True}
+
+        except Exception as e:
+            logger.error(f"stop_usbip error: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
