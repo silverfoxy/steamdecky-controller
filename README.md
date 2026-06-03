@@ -87,6 +87,31 @@ If the controller still works on the Deck, USB/IP is working correctly!
 
 ## Important Notes
 
+### Steam Must Be Running on the PC
+The Steam Deck Controller has a built-in fallback called **lizard mode**. When no
+smart software is driving it, the controller acts as a generic keyboard + mouse so
+it stays usable on any desktop. In lizard mode:
+
+- Right touchpad → mouse cursor
+- Left touchpad → D-pad keys
+- Basic buttons → keyboard keys
+- **Touchpads (as game inputs), back paddles (L4/L5/R4/R5), gyro, and the full
+  analog data are completely absent** — the kernel never creates an input node for
+  them
+
+When Steam starts on the PC it opens the controller's hidraw device exclusively
+and sends a single HID command to disable lizard mode. The controller switches to
+its custom protocol and Steam re-exports everything as a virtual Xbox 360 gamepad
+that games use via Steam Input.
+
+**Start Steam on the PC before connecting.** If you attach the controller first and
+then start Steam, Steam will still pick it up — but until it does, only
+keyboard/mouse emulation is active.
+
+**Paddle mapping is per-game.** Steam Input sees all four paddles (L4/L5/R4/R5),
+but they are not auto-mapped. Go to Steam → Controller Settings → edit the layout
+for each game to bind them.
+
 ### Controller Disabled While Sharing
 When you start sharing:
 - **Physical buttons won't work on the Deck** (controller is unbound)

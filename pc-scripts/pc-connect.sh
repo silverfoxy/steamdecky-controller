@@ -33,6 +33,23 @@ echo "Deck IP: $DECK_IP"
 echo "Bus ID: $BUSID"
 echo
 
+# Steam must be running on the PC for full controller support.
+#
+# Without Steam, the controller stays in "lizard mode" — a built-in fallback
+# where it acts as a generic keyboard + mouse so it remains usable on any
+# desktop. In lizard mode the hid-steam kernel driver only creates two input
+# devices: a keyboard (interfaces 0) and a mouse (interface 1). Interface 2,
+# which carries the touchpad touch data, paddle buttons (L4/L5/R4/R5), gyro,
+# and analog stick data, never gets an input node at all.
+#
+# When Steam starts it opens /dev/hidraw* for the controller exclusively and
+# sends a HID feature report that disables lizard mode. The controller then
+# switches to its custom protocol and hid-steam exposes everything through a
+# virtual Xbox 360 compatible gamepad that games can use via Steam Input.
+#
+# TL;DR: start Steam on this PC before (or after) running this script,
+# otherwise only basic keyboard/mouse emulation will work.
+
 # Load kernel modules
 echo "Loading USB/IP kernel modules..."
 sudo modprobe vhci-hcd
