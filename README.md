@@ -2,12 +2,13 @@
 
 **Share your Steam Deck controller wirelessly over the network**
 
-A beautiful, modern GUI app for sharing your Steam Deck's built-in controller to your PC using USB/IP. Features automatic PC connection detection, screen dimming, and a touch-friendly interface.
+A beautiful, modern GUI app for sharing your Steam Deck's built-in controller to your PC using USB/IP. Features automatic PC connection detection, sleep prevention while sharing, screen dimming, and a touch-friendly interface.
 
 ## Features
 
 - **Share controller over network** - Use your Deck's controls on your PC
 - **PC connection detection** - Automatically detects when your PC connects
+- **Sleep prevention while sharing** - Keeps the Deck awake until sharing stops
 
 ## Prerequisites
 
@@ -96,6 +97,7 @@ Use **touchscreen** to tap **STOP SHARING** button
 3. **Auto Screen Management:**
    - Screen dims after 10 seconds
    - Tap screen to wake
+   - Idle suspend and idle display sleep are blocked while sharing is active
 4. **Stop Sharing** - Controller rebinds to Deck, everything restored
 
 ## Important Notes
@@ -111,6 +113,8 @@ When sharing is active:
 ### Screen Behavior
 
 - **Dims after 10 seconds** - Tap screen to wake
+- **Deck stays awake while sharing** - The controller is unavailable to Steam Input
+  during USB/IP sharing, so the app blocks idle sleep until you stop sharing
 - **Auto-restores on exit** - Brightness returns to normal
 
 ### Network Requirements

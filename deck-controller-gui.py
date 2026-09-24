@@ -33,6 +33,8 @@ import socket
 import glob
 import re
 import logging
+import shutil
+import time
 from pathlib import Path
 from typing import Optional, List
 
@@ -154,19 +156,19 @@ class USBIPController:
 
     def get_connected_clients(self) -> int:
         """Get number of connected USB/IP clients"""
-        if not self.usbip_path:
-            return 0
-
         try:
+            # Check for TCP connections on USB/IP port (3240)
+            # Use ss (socket statistics) to count ESTABLISHED connections
             result = subprocess.run(
-                [self.usbip_path, 'port'],
+                ['ss', '-tn', 'sport', '=', '3240'],
                 capture_output=True,
                 text=True,
                 timeout=2
             )
-            # Count "Port" entries which indicate active connections
-            port_count = result.stdout.count('Port ')
-            return port_count
+            # Count ESTAB connections (each line with ESTAB = one connected client)
+            connection_count = result.stdout.count('ESTAB')
+            logger.debug(f"Connected clients: {connection_count}")
+            return connection_count
         except Exception as e:
             logger.debug(f"Failed to check connected clients: {e}")
             return 0
@@ -447,6 +449,69 @@ class BrightnessController:
         return False
 
 
+class SleepInhibitor:
+    """Keep the Deck awake while its controller is shared over USB/IP."""
+
+    def __init__(self):
+        self.process: Optional[subprocess.Popen] = None
+
+    def start(self) -> bool:
+        """Block idle sleep for the lifetime of the sharing session."""
+        if self.process and self.process.poll() is None:
+            return True
+
+        systemd_inhibit = shutil.which('systemd-inhibit')
+        sleep = shutil.which('sleep')
+        if not systemd_inhibit or not sleep:
+            logger.warning("systemd-inhibit is unavailable; the Deck may sleep while sharing")
+            return False
+
+        try:
+            self.process = subprocess.Popen(
+                [
+                    systemd_inhibit,
+                    '--what=idle:sleep',
+                    '--mode=block',
+                    '--no-ask-password',
+                    '--who=Steamy Controller',
+                    '--why=Controller is being shared over USB/IP',
+                    '--', sleep, 'infinity',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # systemd-inhibit reports D-Bus permission or session errors by
+            # exiting immediately. Check now so the app does not imply that
+            # sleep prevention is active when it could not be enabled.
+            time.sleep(0.05)
+            if self.process.poll() is not None:
+                logger.warning("systemd-inhibit exited before acquiring an idle lock")
+                self.process = None
+                return False
+            logger.info("Idle sleep inhibited while controller sharing is active")
+            return True
+        except OSError as e:
+            logger.warning(f"Could not inhibit idle sleep: {e}")
+            self.process = None
+            return False
+
+    def stop(self):
+        """Release the inhibitor when controller sharing ends."""
+        if not self.process:
+            return
+
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+
+        self.process = None
+        logger.info("Idle sleep inhibitor released")
+
+
 class RoundedButton(Button):
     """Custom button with rounded corners"""
     bg_color = ListProperty([0.3, 0.3, 0.3, 1])
@@ -501,6 +566,7 @@ class ControllerApp(App):
         # Controllers
         self.usbip = USBIPController()
         self.brightness = BrightnessController()
+        self.sleep_inhibitor = SleepInhibitor()
 
         # State
         self.sharing = False
@@ -662,6 +728,7 @@ class ControllerApp(App):
 
         if success:
             self.sharing = True
+            self.sleep_inhibitor.start()
             self.status_label.text = "STATUS: Sharing Active"
             self.status_label.color = (0.15, 0.64, 0.41, 1)  # Green
 
@@ -673,6 +740,7 @@ class ControllerApp(App):
                 f"Or manually:\n"
                 f"  sudo usbip attach -r {deck_ip} -b {result}\n\n"
                 f"Use touchscreen to stop (buttons won't work!)\n"
+                f"The Deck will stay awake while sharing is active.\n"
                 f"Screen will dim in 10 seconds (tap to wake)..."
             )
             self.instructions.text = instructions
@@ -720,6 +788,7 @@ class ControllerApp(App):
         success, message = self.usbip.stop_sharing()
 
         self.sharing = False
+        self.sleep_inhibitor.stop()
         self.status_label.text = "STATUS: Ready"
         self.status_label.color = (0.91, 0.33, 0.13, 1)  # Orange
         self.instructions.text = ""
@@ -804,6 +873,8 @@ class ControllerApp(App):
         if self.sharing:
             self.usbip.stop_sharing()
 
+        self.sleep_inhibitor.stop()
+
         # Force brightness restore
         if self.brightness.original_brightness:
             self.brightness.set_brightness(self.brightness.original_brightness)
@@ -811,6 +882,11 @@ class ControllerApp(App):
         self.brightness.is_off = False
 
         self.stop()
+
+    def on_stop(self):
+        """Release the sleep inhibitor if the window is closed directly."""
+        if hasattr(self, 'sleep_inhibitor'):
+            self.sleep_inhibitor.stop()
 
 
 def main():
