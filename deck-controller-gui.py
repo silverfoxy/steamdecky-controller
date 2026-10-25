@@ -31,12 +31,10 @@ from kivy.properties import StringProperty, ListProperty
 import subprocess
 import socket
 import glob
-import re
 import logging
-import shutil
-import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
+from deck_services import DiscoveryAdvertiser, SleepInhibitor, parse_controller_busid
 
 # Configure logging
 LOG_FILE = "/tmp/steamdecky-controller.log"
@@ -132,9 +130,8 @@ class USBIPController:
                     logger.info(f"Found controller: {line.strip()}")
 
                     # Extract busid (format: "busid 3-3" or similar)
-                    match = re.search(r'busid\s+(\d+-\d+)', line)
-                    if match:
-                        busid = match.group(1)
+                    busid = parse_controller_busid(line)
+                    if busid:
                         logger.info(f"Extracted busid: {busid}")
                         return busid
 
@@ -246,34 +243,23 @@ class USBIPController:
 
         return True, busid
 
-    def get_bound_devices(self) -> List[str]:
-        """Get list of devices currently bound to usbip-host"""
-        bound_devices = []
-        try:
-            driver_path = Path('/sys/bus/usb/drivers/usbip-host/')
-            if driver_path.exists():
-                for item in driver_path.iterdir():
-                    if re.match(r'^\d+-\d+$', item.name):
-                        bound_devices.append(item.name)
-        except Exception as e:
-            logger.error(f"Failed to get bound devices: {e}")
-
-        return bound_devices
-
     def unbind_device(self, busid: str) -> bool:
         """Unbind device from usbip-host"""
         try:
             logger.info(f"Unbinding {busid} from usbip-host...")
             unbind_path = '/sys/bus/usb/drivers/usbip-host/unbind'
 
-            # Use tee to write with sudo privileges
-            subprocess.run(
-                ['sudo', 'tee', unbind_path],
-                input=busid,
-                text=True,
-                capture_output=True,
-                check=True
-            )
+            # Probe can fail after unbind succeeds. On retry, skip the already
+            # completed unbind and retry only probing the original driver.
+            bound_path = Path('/sys/bus/usb/drivers/usbip-host') / busid
+            if bound_path.exists():
+                subprocess.run(
+                    ['sudo', 'tee', unbind_path],
+                    input=busid,
+                    text=True,
+                    capture_output=True,
+                    check=True
+                )
 
             # Rebind to original driver
             logger.info(f"Rebinding {busid} to system...")
@@ -292,17 +278,6 @@ class USBIPController:
             logger.error(f"Failed to unbind device: {e}")
             return False
 
-    def stop_daemon(self) -> bool:
-        """Stop usbipd daemon"""
-        try:
-            logger.info("Stopping usbipd daemon...")
-            subprocess.run(['sudo', 'killall', 'usbipd'], capture_output=True)
-            logger.info("usbipd stopped")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to stop usbipd: {e}")
-            return False
-
     def stop_sharing(self) -> tuple[bool, str]:
         """
         Stop USB/IP sharing
@@ -312,24 +287,15 @@ class USBIPController:
         logger.info("Stopping USB/IP sharing...")
         logger.info("=" * 50)
 
-        # Unbind all devices FIRST (before stopping daemon)
-        bound_devices = self.get_bound_devices()
+        busid = self.current_busid
+        if not busid:
+            return False, "No exported controller is tracked; restore it manually"
+        if not self.unbind_device(busid):
+            return False, f"Failed to restore controller {busid}; retry or restore manually"
 
-        if not bound_devices:
-            logger.info("No devices currently bound")
-        else:
-            for busid in bound_devices:
-                self.unbind_device(busid)
-
-        # Now stop daemon
-        self.stop_daemon()
-
+        # usbipd may serve other exports; leave the daemon running.
         self.current_busid = None
-
-        logger.info("=" * 50)
-        logger.info("Controller restored to Deck")
-        logger.info("=" * 50)
-
+        logger.info("Controller %s restored to Deck", busid)
         return True, "Controller restored"
 
 
@@ -449,69 +415,6 @@ class BrightnessController:
         return False
 
 
-class SleepInhibitor:
-    """Keep the Deck awake while its controller is shared over USB/IP."""
-
-    def __init__(self):
-        self.process: Optional[subprocess.Popen] = None
-
-    def start(self) -> bool:
-        """Block idle sleep for the lifetime of the sharing session."""
-        if self.process and self.process.poll() is None:
-            return True
-
-        systemd_inhibit = shutil.which('systemd-inhibit')
-        sleep = shutil.which('sleep')
-        if not systemd_inhibit or not sleep:
-            logger.warning("systemd-inhibit is unavailable; the Deck may sleep while sharing")
-            return False
-
-        try:
-            self.process = subprocess.Popen(
-                [
-                    systemd_inhibit,
-                    '--what=idle:sleep',
-                    '--mode=block',
-                    '--no-ask-password',
-                    '--who=Steamy Controller',
-                    '--why=Controller is being shared over USB/IP',
-                    '--', sleep, 'infinity',
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # systemd-inhibit reports D-Bus permission or session errors by
-            # exiting immediately. Check now so the app does not imply that
-            # sleep prevention is active when it could not be enabled.
-            time.sleep(0.05)
-            if self.process.poll() is not None:
-                logger.warning("systemd-inhibit exited before acquiring an idle lock")
-                self.process = None
-                return False
-            logger.info("Idle sleep inhibited while controller sharing is active")
-            return True
-        except OSError as e:
-            logger.warning(f"Could not inhibit idle sleep: {e}")
-            self.process = None
-            return False
-
-    def stop(self):
-        """Release the inhibitor when controller sharing ends."""
-        if not self.process:
-            return
-
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-
-        self.process = None
-        logger.info("Idle sleep inhibitor released")
-
-
 class RoundedButton(Button):
     """Custom button with rounded corners"""
     bg_color = ListProperty([0.3, 0.3, 0.3, 1])
@@ -567,9 +470,11 @@ class ControllerApp(App):
         self.usbip = USBIPController()
         self.brightness = BrightnessController()
         self.sleep_inhibitor = SleepInhibitor()
+        self.discovery = DiscoveryAdvertiser()
 
         # State
         self.sharing = False
+        self.restore_error = None
         self.dim_timer = None
         self.screen_off_timer = None
 
@@ -692,6 +597,7 @@ class ControllerApp(App):
 
         # Bind touch event
         Window.bind(on_touch_down=self.on_screen_tap)
+        Window.bind(on_request_close=self.on_request_close)
 
         # Start status checker
         Clock.schedule_interval(self.check_status, 2)
@@ -728,19 +634,20 @@ class ControllerApp(App):
 
         if success:
             self.sharing = True
-            self.sleep_inhibitor.start()
+            sleep_ok = self.sleep_inhibitor.start()
+            discovered = self.discovery.start(result)
             self.status_label.text = "STATUS: Sharing Active"
             self.status_label.color = (0.15, 0.64, 0.41, 1)  # Green
 
             deck_ip = self.get_local_ip()
+            connect_cmd = './pc-connect.sh' if discovered else f'./pc-connect.sh {deck_ip} {result}'
             instructions = (
                 f"On your PC, run:\n\n"
                 f"  cd pc-scripts\n"
-                f"  ./pc-connect.sh {deck_ip}\n\n"
-                f"Or manually:\n"
-                f"  sudo usbip attach -r {deck_ip} -b {result}\n\n"
+                f"  {connect_cmd}\n\n"
+                f"Manual fallback: ./pc-connect.sh {deck_ip} {result}\n\n"
                 f"Use touchscreen to stop (buttons won't work!)\n"
-                f"The Deck will stay awake while sharing is active.\n"
+                f"{'Deck sleep blocked while sharing.' if sleep_ok else 'WARNING: Sleep lock unavailable; Deck may sleep.'}\n"
                 f"Screen will dim in 10 seconds (tap to wake)..."
             )
             self.instructions.text = instructions
@@ -778,6 +685,7 @@ class ControllerApp(App):
             return
 
         logger.info("Stopping controller sharing...")
+        self.restore_error = None
         self.status_label.text = "STATUS: Stopping..."
         self.stop_btn.disabled = True
 
@@ -786,7 +694,24 @@ class ControllerApp(App):
     def _do_stop_sharing(self):
         """Actually perform the stop operation"""
         success, message = self.usbip.stop_sharing()
+        if not success:
+            self.restore_error = message
+            logger.error("Controller restore failed: %s", message)
+            self.status_label.text = "STATUS: Restore failed - tap STOP to retry"
+            self.status_label.color = (0.75, 0.11, 0.16, 1)
+            self.instructions.text = message
+            self.stop_btn.disabled = False
+            if self.dim_timer:
+                self.dim_timer.cancel()
+                self.dim_timer = None
+            if self.screen_off_timer:
+                self.screen_off_timer.cancel()
+                self.screen_off_timer = None
+            self.brightness.restore()
+            self.sleep_inhibitor.ensure_active()
+            return
 
+        self.discovery.stop()
         self.sharing = False
         self.sleep_inhibitor.stop()
         self.status_label.text = "STATUS: Ready"
@@ -822,17 +747,25 @@ class ControllerApp(App):
     def check_status(self, dt):
         """Periodically check USB/IP status and connected clients"""
         if self.sharing:
+            # Recover from an exited Avahi publisher or idle-sleep inhibitor.
+            # Keep the lock alive even while the PC is attached and screen is dim.
+            sleep_ok = self.sleep_inhibitor.ensure_active()
+            if self.usbip.current_busid:
+                self.discovery.ensure_active(self.usbip.current_busid)
             # Check if PC is connected
             connected_clients = self.usbip.get_connected_clients()
-            if connected_clients > 0:
+            if not sleep_ok:
+                self.status_label.text = "STATUS: WARNING - sleep lock unavailable"
+                self.status_label.color = (0.75, 0.11, 0.16, 1)
+            elif self.restore_error:
+                self.status_label.text = "STATUS: Restore failed - tap STOP to retry"
+                self.status_label.color = (0.75, 0.11, 0.16, 1)
+            elif connected_clients > 0:
                 self.status_label.text = f"STATUS: PC Connected ({connected_clients})"
                 self.status_label.color = (0.15, 0.64, 0.41, 1)  # Green
             else:
                 self.status_label.text = "STATUS: Waiting for PC..."
                 self.status_label.color = (0.91, 0.33, 0.13, 1)  # Orange
-        elif self.usbip.is_usbipd_running():
-            self.status_label.text = "STATUS: WARNING - USB/IP active"
-            self.status_label.color = (0.91, 0.33, 0.13, 1)  # Orange
 
     def view_log(self, instance):
         """Open log file in popup with scrollbar"""
@@ -867,26 +800,41 @@ class ControllerApp(App):
         popup.open()
 
     def exit_app(self, instance):
-        """Exit application"""
+        """Do not close while the controller is still exported."""
         logger.info("Exiting application...")
-
         if self.sharing:
-            self.usbip.stop_sharing()
-
-        self.sleep_inhibitor.stop()
-
-        # Force brightness restore
-        if self.brightness.original_brightness:
-            self.brightness.set_brightness(self.brightness.original_brightness)
-        self.brightness.is_dimmed = False
-        self.brightness.is_off = False
-
+            self._do_stop_sharing()
+            if self.sharing:
+                return  # Restore failed; leave touch UI and sleep lock available.
         self.stop()
 
+    def on_request_close(self, *args, **kwargs):
+        """Kivy: returning True cancels a close when restore failed."""
+        if self.sharing:
+            self._do_stop_sharing()
+        return self.sharing
+
     def on_stop(self):
-        """Release the sleep inhibitor if the window is closed directly."""
-        if hasattr(self, 'sleep_inhibitor'):
-            self.sleep_inhibitor.stop()
+        """Last-chance restoration if the window is terminated unexpectedly."""
+        restored = not getattr(self, 'sharing', False)
+        try:
+            if not restored:
+                restored, message = self.usbip.stop_sharing()
+                if restored:
+                    self.sharing = False
+                else:
+                    logger.error('Controller still exported on exit: %s', message)
+        finally:
+            if hasattr(self, 'discovery'):
+                self.discovery.stop()
+            if hasattr(self, 'sleep_inhibitor'):
+                if restored:
+                    self.sleep_inhibitor.stop()
+                else:
+                    # A failed restore must not release the sleep lock.
+                    self.sleep_inhibitor.ensure_active()
+            if hasattr(self, 'brightness'):
+                self.brightness.restore()
 
 
 def main():
