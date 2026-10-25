@@ -1,220 +1,639 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """
-Steam Deck Controller USB/IP - Touchscreen GUI
-Big buttons for when controller is disabled
+Steamy Controller - Share your Steam Deck controller over the network
+Modern touch-friendly Kivy GUI with beautiful design
 """
 
-import tkinter as tk
-from tkinter import font as tkfont
-import subprocess
-import socket
 import os
+import sys
 from pathlib import Path
 
-# Get script directory
-SCRIPT_DIR = Path(__file__).parent
-START_SCRIPT = SCRIPT_DIR / "deck-start-usbip.sh"
-STOP_SCRIPT = SCRIPT_DIR / "deck-stop-usbip.sh"
+# Add lib directory to Python path for dependencies
+sys.path.insert(0, str(Path(__file__).parent / 'lib'))
 
-class ControllerApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Steam Deck Controller Share")
-        self.root.attributes('-fullscreen', True)
-        self.root.configure(bg='#1b2838')  # Steam dark blue
+os.environ['KIVY_NO_ARGS'] = '1'  # Prevent Kivy from reading command line args
 
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.widget import Widget
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.textinput import TextInput
+from kivy.uix.modalview import ModalView
+from kivy.uix.image import Image
+from kivy.clock import Clock
+from kivy.core.window import Window
+from kivy.graphics import Color, Rectangle, RoundedRectangle, Ellipse
+from kivy.metrics import dp
+from kivy.properties import StringProperty, ListProperty
+
+import subprocess
+import socket
+import glob
+import re
+import logging
+from pathlib import Path
+from typing import Optional, List
+
+# Configure logging
+LOG_FILE = "/tmp/steamdecky-controller.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class USBIPController:
+    """Pure Python USB/IP controller management"""
+
+    CONTROLLER_VID_PID = "28de:1205"  # Valve Steam Deck controller
+    CONTROLLER_KEYWORDS = ["valve", "steam"]
+
+    def __init__(self):
+        self.usbip_path = self.find_usbip()
+        self.usbipd_path = self.find_usbipd()
+        self.current_busid: Optional[str] = None
+
+    def find_usbip(self) -> Optional[str]:
+        """Find usbip binary (Nix or system)"""
+        candidates = [
+            Path.home() / ".nix-profile/bin/usbip",
+            "/usr/bin/usbip",
+            "/usr/local/bin/usbip"
+        ]
+
+        for path in candidates:
+            if path.exists():
+                logger.info(f"Found usbip at: {path}")
+                return str(path)
+
+        logger.error("usbip not found! Install with: nix profile install nixpkgs#linuxPackages.usbip")
+        return None
+
+    def find_usbipd(self) -> Optional[str]:
+        """Find usbipd binary"""
+        if self.usbip_path:
+            usbipd = Path(self.usbip_path).parent / "usbipd"
+            if usbipd.exists():
+                return str(usbipd)
+        return None
+
+    def clean_environment(self):
+        """Remove Steam environment variables that interfere"""
+        for var in ['LD_PRELOAD', 'LD_LIBRARY_PATH']:
+            if var in os.environ:
+                del os.environ[var]
+                logger.debug(f"Removed {var} from environment")
+
+    def load_kernel_modules(self) -> bool:
+        """Load required kernel modules"""
+        modules = ['usbip-core', 'usbip-host']
+
+        for module in modules:
+            try:
+                logger.info(f"Loading kernel module: {module}")
+                subprocess.run(['sudo', 'modprobe', module], check=True, capture_output=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to load {module}: {e.stderr.decode()}")
+                return False
+
+        return True
+
+    def find_controller(self) -> Optional[str]:
+        """Find Steam Deck controller device and return busid"""
+        if not self.usbip_path:
+            return None
+
+        try:
+            logger.info("Searching for Steam Deck controller...")
+            result = subprocess.run(
+                [self.usbip_path, 'list', '-l'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            # Parse output for controller
+            for line in result.stdout.split('\n'):
+                line_lower = line.lower()
+
+                # Check for VID:PID or keywords
+                if self.CONTROLLER_VID_PID in line_lower or \
+                   any(keyword in line_lower for keyword in self.CONTROLLER_KEYWORDS):
+                    logger.info(f"Found controller: {line.strip()}")
+
+                    # Extract busid (format: "busid 3-3" or similar)
+                    match = re.search(r'busid\s+(\d+-\d+)', line)
+                    if match:
+                        busid = match.group(1)
+                        logger.info(f"Extracted busid: {busid}")
+                        return busid
+
+            logger.error("Steam Deck controller not found in USB devices")
+            logger.debug(f"USB devices:\n{result.stdout}")
+            return None
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to list USB devices: {e.stderr}")
+            return None
+
+    def is_usbipd_running(self) -> bool:
+        """Check if usbipd daemon is running"""
+        try:
+            result = subprocess.run(['pgrep', 'usbipd'], capture_output=True)
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def get_connected_clients(self) -> int:
+        """Get number of connected USB/IP clients"""
+        if not self.usbip_path:
+            return 0
+
+        try:
+            result = subprocess.run(
+                [self.usbip_path, 'port'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            # Count "Port" entries which indicate active connections
+            port_count = result.stdout.count('Port ')
+            return port_count
+        except Exception as e:
+            logger.debug(f"Failed to check connected clients: {e}")
+            return 0
+
+    def start_daemon(self) -> bool:
+        """Start usbipd daemon"""
+        if not self.usbipd_path:
+            logger.error("usbipd not found")
+            return False
+
+        if self.is_usbipd_running():
+            logger.info("usbipd already running")
+            return True
+
+        try:
+            logger.info("Starting usbipd daemon...")
+            subprocess.run(
+                ['sudo', self.usbipd_path, '-D'],
+                check=True,
+                capture_output=True
+            )
+            logger.info("usbipd started successfully")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to start usbipd: {e.stderr.decode()}")
+            return False
+
+    def bind_device(self, busid: str) -> bool:
+        """Bind device to usbip-host"""
+        if not self.usbip_path:
+            return False
+
+        try:
+            logger.info(f"Binding device {busid}...")
+            subprocess.run(
+                ['sudo', self.usbip_path, 'bind', '-b', busid],
+                check=True,
+                capture_output=True
+            )
+            self.current_busid = busid
+            logger.info(f"Device {busid} bound successfully")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to bind device: {e.stderr.decode()}")
+            return False
+
+    def start_sharing(self) -> tuple[bool, str]:
+        """
+        Start USB/IP sharing
+        Returns: (success: bool, message: str)
+        """
+        self.clean_environment()
+
+        # Load kernel modules
+        if not self.load_kernel_modules():
+            return False, "Failed to load kernel modules"
+
+        # Find controller
+        busid = self.find_controller()
+        if not busid:
+            return False, "Controller not found"
+
+        # Start daemon
+        if not self.start_daemon():
+            return False, "Failed to start usbipd"
+
+        # Bind device
+        if not self.bind_device(busid):
+            return False, "Failed to bind device"
+
+        logger.info("=" * 50)
+        logger.info("SUCCESS! Controller exported via USB/IP")
+        logger.info(f"Busid: {busid}")
+        logger.info("=" * 50)
+
+        return True, busid
+
+    def get_bound_devices(self) -> List[str]:
+        """Get list of devices currently bound to usbip-host"""
+        bound_devices = []
+        try:
+            driver_path = Path('/sys/bus/usb/drivers/usbip-host/')
+            if driver_path.exists():
+                for item in driver_path.iterdir():
+                    if re.match(r'^\d+-\d+$', item.name):
+                        bound_devices.append(item.name)
+        except Exception as e:
+            logger.error(f"Failed to get bound devices: {e}")
+
+        return bound_devices
+
+    def unbind_device(self, busid: str) -> bool:
+        """Unbind device from usbip-host"""
+        try:
+            logger.info(f"Unbinding {busid} from usbip-host...")
+            unbind_path = '/sys/bus/usb/drivers/usbip-host/unbind'
+
+            # Use tee to write with sudo privileges
+            subprocess.run(
+                ['sudo', 'tee', unbind_path],
+                input=busid,
+                text=True,
+                capture_output=True,
+                check=True
+            )
+
+            # Rebind to original driver
+            logger.info(f"Rebinding {busid} to system...")
+            probe_path = '/sys/bus/usb/drivers_probe'
+            subprocess.run(
+                ['sudo', 'tee', probe_path],
+                input=busid,
+                text=True,
+                capture_output=True,
+                check=True
+            )
+
+            logger.info(f"Device {busid} restored")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to unbind device: {e}")
+            return False
+
+    def stop_daemon(self) -> bool:
+        """Stop usbipd daemon"""
+        try:
+            logger.info("Stopping usbipd daemon...")
+            subprocess.run(['sudo', 'killall', 'usbipd'], capture_output=True)
+            logger.info("usbipd stopped")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to stop usbipd: {e}")
+            return False
+
+    def stop_sharing(self) -> tuple[bool, str]:
+        """
+        Stop USB/IP sharing
+        Returns: (success: bool, message: str)
+        """
+        logger.info("=" * 50)
+        logger.info("Stopping USB/IP sharing...")
+        logger.info("=" * 50)
+
+        # Unbind all devices FIRST (before stopping daemon)
+        bound_devices = self.get_bound_devices()
+
+        if not bound_devices:
+            logger.info("No devices currently bound")
+        else:
+            for busid in bound_devices:
+                self.unbind_device(busid)
+
+        # Now stop daemon
+        self.stop_daemon()
+
+        self.current_busid = None
+
+        logger.info("=" * 50)
+        logger.info("Controller restored to Deck")
+        logger.info("=" * 50)
+
+        return True, "Controller restored"
+
+
+class BrightnessController:
+    """Screen brightness management"""
+
+    def __init__(self):
+        self.backlight_path = self.find_backlight_device()
+        self.original_brightness: Optional[int] = None
+        self.is_dimmed = False
+        self.is_off = False
+
+    def find_backlight_device(self) -> Optional[Path]:
+        """Find backlight device"""
+        try:
+            backlight_dirs = glob.glob('/sys/class/backlight/*')
+            if backlight_dirs:
+                path = Path(backlight_dirs[0])
+                logger.info(f"Found backlight device: {path}")
+                return path
+        except Exception as e:
+            logger.error(f"Failed to find backlight device: {e}")
+        return None
+
+    def get_brightness(self) -> Optional[int]:
+        """Get current brightness"""
+        if not self.backlight_path:
+            return None
+        try:
+            with open(self.backlight_path / 'brightness', 'r') as f:
+                return int(f.read().strip())
+        except Exception as e:
+            logger.error(f"Failed to read brightness: {e}")
+            return None
+
+    def get_max_brightness(self) -> Optional[int]:
+        """Get maximum brightness"""
+        if not self.backlight_path:
+            return None
+        try:
+            with open(self.backlight_path / 'max_brightness', 'r') as f:
+                return int(f.read().strip())
+        except Exception as e:
+            logger.error(f"Failed to read max brightness: {e}")
+            return None
+
+    def set_brightness(self, value: int) -> bool:
+        """Set brightness value"""
+        if not self.backlight_path:
+            return False
+        try:
+            brightness_file = self.backlight_path / 'brightness'
+            # Use tee to write with sudo privileges
+            proc = subprocess.run(
+                ['sudo', 'tee', str(brightness_file)],
+                input=str(value),
+                text=True,
+                capture_output=True,
+                check=True
+            )
+            logger.debug(f"Set brightness to {value}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set brightness: {e}")
+            return False
+
+    def dim(self, percent: float = 0.10) -> bool:
+        """Dim screen to specified percentage"""
+        if self.is_dimmed:
+            return True
+
+        current = self.get_brightness()
+        max_brightness = self.get_max_brightness()
+
+        if current is not None and max_brightness is not None:
+            self.original_brightness = current
+            dim_value = max(1, int(max_brightness * percent))
+
+            if self.set_brightness(dim_value):
+                self.is_dimmed = True
+                logger.info(f"Screen dimmed to {percent*100}%")
+                return True
+
+        return False
+
+    def screen_off(self) -> bool:
+        """Turn off screen completely"""
+        if self.is_off:
+            return True
+
+        # Save current brightness if not already saved
+        if self.original_brightness is None:
+            current = self.get_brightness()
+            if current is not None:
+                self.original_brightness = current
+
+        if self.set_brightness(0):
+            self.is_off = True
+            self.is_dimmed = False
+            logger.info("Screen turned off")
+            return True
+
+        return False
+
+    def restore(self) -> bool:
+        """Restore original brightness"""
+        if (not self.is_dimmed and not self.is_off) or self.original_brightness is None:
+            return True
+
+        if self.set_brightness(self.original_brightness):
+            logger.info(f"Screen brightness restored to {self.original_brightness}")
+            self.is_dimmed = False
+            self.is_off = False
+            self.original_brightness = None
+            return True
+
+        return False
+
+
+class RoundedButton(Button):
+    """Custom button with rounded corners"""
+    bg_color = ListProperty([0.3, 0.3, 0.3, 1])
+
+    def __init__(self, **kwargs):
+        # Extract bg_color before passing to super
+        if 'background_color' in kwargs:
+            self.bg_color = kwargs.pop('background_color')
+        super().__init__(**kwargs)
+        self.background_normal = ''
+        self.background_down = ''
+        self.background_color = (0, 0, 0, 0)
+        self.bind(pos=self.update_canvas, size=self.update_canvas,
+                 disabled=self.update_canvas, bg_color=self.update_canvas)
+        self.update_canvas()
+
+    def update_canvas(self, *args):
+        self.canvas.before.clear()
+        with self.canvas.before:
+            alpha = 0.4 if self.disabled else 1.0
+            Color(self.bg_color[0], self.bg_color[1], self.bg_color[2], alpha)
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(15)])
+
+
+class Card(BoxLayout):
+    """Card widget with semi-transparent rounded background"""
+    bg_color = ListProperty([0.15, 0.15, 0.17, 0.85])  # Semi-transparent
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(pos=self.update_canvas, size=self.update_canvas)
+        self.update_canvas()
+
+    def update_canvas(self, *args):
+        self.canvas.before.clear()
+        with self.canvas.before:
+            Color(*self.bg_color)
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(15)])
+            # Add subtle border
+            Color(0.3, 0.3, 0.35, 0.6)
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(15)], width=dp(1))
+
+
+class ControllerApp(App):
+    """Main Kivy Application"""
+
+    def build(self):
+        # Set fullscreen
+        Window.fullscreen = 'auto'
+        Window.clearcolor = (0.17, 0.17, 0.17, 1)  # Dark background
+
+        # Controllers
+        self.usbip = USBIPController()
+        self.brightness = BrightnessController()
+
+        # State
         self.sharing = False
-        self.process = None
+        self.dim_timer = None
+        self.screen_off_timer = None
 
-        # Big fonts for touchscreen
-        self.title_font = tkfont.Font(family="Arial", size=32, weight="bold")
-        self.button_font = tkfont.Font(family="Arial", size=28, weight="bold")
-        self.status_font = tkfont.Font(family="Arial", size=20)
+        # Build UI
+        return self.build_ui()
 
-        self.setup_ui()
-        self.update_status()
+    def build_ui(self):
+        """Build the main UI"""
+        # Root container
+        root = BoxLayout(orientation='vertical')
 
-    def setup_ui(self):
-        # Header with gradient effect (simulated with frames)
-        header = tk.Frame(self.root, bg='#171a21', height=120)
-        header.pack(fill='x')
-        header.pack_propagate(False)
+        # Load background image as texture from project directory
+        from kivy.core.image import Image as CoreImage
+        from pathlib import Path
+        bg_path = Path(__file__).parent / 'background.webp'
+        bg_texture = CoreImage(str(bg_path)).texture
 
-        # Title with glow effect (using multiple labels)
-        title_frame = tk.Frame(header, bg='#171a21')
-        title_frame.place(relx=0.5, rely=0.5, anchor='center')
+        # Draw background on canvas
+        with root.canvas.before:
+            # Background image
+            Color(1, 1, 1, 1)
+            self.bg_rect = Rectangle(texture=bg_texture, pos=(0, 0), size=Window.size)
+            # Darker overlay to make background less visible
+            Color(0, 0, 0, 0.60)
+            self.overlay_rect = Rectangle(pos=(0, 0), size=Window.size)
 
-        title = tk.Label(
-            title_frame,
-            text="🎮 Controller Share",
-            font=self.title_font,
-            bg='#171a21',
-            fg='#66c0f4'
-        )
-        title.pack()
+        # Update background size on window resize
+        def update_bg(*args):
+            self.bg_rect.size = Window.size
+            self.overlay_rect.size = Window.size
+        Window.bind(size=update_bg)
 
-        subtitle = tk.Label(
-            title_frame,
-            text="Share your Steam Deck controller over USB/IP",
-            font=tkfont.Font(family="Arial", size=14),
-            bg='#171a21',
-            fg='#8f98a0'
-        )
-        subtitle.pack()
+        # Main content container with better spacing
+        main = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(25))
 
-        # Status card with border
-        status_card = tk.Frame(self.root, bg='#212b36', relief='raised', bd=2)
-        status_card.pack(pady=20, padx=40, fill='x')
+        # Header (no background card)
+        header = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(100),
+                          spacing=dp(5))
 
-        # Status indicator
-        status_inner = tk.Frame(status_card, bg='#212b36')
-        status_inner.pack(pady=15, padx=15)
+        icon = Label(text='~ STEAMY CONTROLLER ~', font_size=dp(44), bold=True,
+                    size_hint_y=None, height=dp(60),
+                    color=(0.91, 0.33, 0.13, 1))  # Yaru orange
+        header.add_widget(icon)
 
-        self.status_indicator = tk.Label(
-            status_inner,
-            text="●",
-            font=tkfont.Font(family="Arial", size=40),
-            bg='#212b36',
-            fg='#66c0f4'  # Blue (ready state)
-        )
-        self.status_indicator.pack(side='left', padx=10)
+        subtitle = Label(text='Share your controller wirelessly over the network',
+                        font_size=dp(18), size_hint_y=None, height=dp(35),
+                        text_size=(Window.width - dp(40), None), halign='center',
+                        color=(1, 1, 1, 1))
+        header.add_widget(subtitle)
 
-        status_text_frame = tk.Frame(status_inner, bg='#212b36')
-        status_text_frame.pack(side='left', fill='both', expand=True)
+        main.add_widget(header)
 
-        self.status_label = tk.Label(
-            status_text_frame,
-            text="Ready",
-            font=tkfont.Font(family="Arial", size=24, weight="bold"),
-            bg='#212b36',
-            fg='white'
-        )
-        self.status_label.pack(anchor='w')
+        # Separator line
+        separator1 = Widget(size_hint_y=None, height=dp(2))
+        with separator1.canvas:
+            Color(0.91, 0.33, 0.13, 0.5)
+            Rectangle(pos=(dp(20), 0), size=(Window.width - dp(40), dp(2)))
+        main.add_widget(separator1)
 
-        # IP Address label
-        self.ip_label = tk.Label(
-            status_text_frame,
-            text=f"Deck IP: {self.get_local_ip()}",
-            font=tkfont.Font(family="Arial", size=16),
-            bg='#212b36',
-            fg='#8f98a0'
-        )
-        self.ip_label.pack(anchor='w')
+        # Status (no background card, no icon - just text)
+        status_box = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(70),
+                              spacing=dp(5), padding=(dp(10), 0))
 
-        # Instructions label (fixed height so it doesn't push buttons off screen)
-        instructions_frame = tk.Frame(self.root, bg='#1b2838', height=150)
-        instructions_frame.pack(pady=10, fill='x')
-        instructions_frame.pack_propagate(False)  # Don't resize based on content
+        # Status with colored text
+        self.status_label = Label(text='STATUS: Ready', font_size=dp(32), bold=True, halign='left',
+                                 size_hint_y=None, height=dp(42),
+                                 color=(0.91, 0.33, 0.13, 1))  # Orange
+        self.status_label.bind(size=self.status_label.setter('text_size'))
+        status_box.add_widget(self.status_label)
 
-        self.instructions = tk.Label(
-            instructions_frame,
-            text="",
-            font=tkfont.Font(family="Arial", size=14),
-            bg='#1b2838',
-            fg='#8f98a0',
-            justify='left',
-            wraplength=700
-        )
-        self.instructions.pack()
+        self.ip_label = Label(text=f'Deck IP: {self.get_local_ip()}',
+                             font_size=dp(20), halign='left',
+                             size_hint_y=None, height=dp(28),
+                             color=(0.85, 0.85, 0.85, 1))
+        self.ip_label.bind(size=self.ip_label.setter('text_size'))
+        status_box.add_widget(self.ip_label)
 
-        # Button frame
-        button_frame = tk.Frame(self.root, bg='#1b2838')
-        button_frame.pack(expand=True)
+        main.add_widget(status_box)
 
-        # Start button (BIG for touchscreen) with modern styling
-        self.start_btn = tk.Button(
-            button_frame,
-            text="▶  START SHARING",
-            font=self.button_font,
-            bg='#5c7e10',  # Steam green
-            fg='white',
-            activebackground='#7ba31a',
-            activeforeground='white',
-            command=self.start_sharing,
-            width=22,
-            height=3,
-            relief='flat',
-            bd=0,
-            cursor='hand2',
-            highlightthickness=0
-        )
-        self.start_btn.pack(pady=15)
-        # Bind hover effects
-        self.start_btn.bind('<Enter>', lambda e: self.start_btn.config(bg='#6ea113'))
-        self.start_btn.bind('<Leave>', lambda e: self.start_btn.config(bg='#5c7e10'))
+        # Instructions (no background card)
+        self.instructions = Label(text='', font_size=dp(18),
+                                 size_hint_y=None, height=dp(140),
+                                 text_size=(Window.width - dp(50), None), valign='top',
+                                 halign='left', padding=(dp(10), dp(10)),
+                                 color=(1, 1, 1, 1))
+        main.add_widget(self.instructions)
 
-        # Stop button (BIG for touchscreen) with modern styling
-        self.stop_btn = tk.Button(
-            button_frame,
-            text="⏹  STOP SHARING",
-            font=self.button_font,
-            bg='#a94442',  # Darker red
-            fg='white',
-            activebackground='#c9302c',
-            activeforeground='white',
-            command=self.stop_sharing,
-            width=22,
-            height=3,
-            relief='flat',
-            bd=0,
-            cursor='hand2',
-            state='disabled',
-            highlightthickness=0
-        )
-        self.stop_btn.pack(pady=15)
-        # Bind hover effects
-        self.stop_btn.bind('<Enter>', lambda e: self.stop_btn.config(bg='#c9302c') if self.stop_btn['state'] == 'normal' else None)
-        self.stop_btn.bind('<Leave>', lambda e: self.stop_btn.config(bg='#a94442') if self.stop_btn['state'] == 'normal' else None)
+        # Spacer
+        main.add_widget(Widget())
 
-        # Bottom buttons frame
-        bottom_frame = tk.Frame(self.root, bg='#1b2838')
-        bottom_frame.pack(side='bottom', pady=25)
+        # Buttons with rounded style and bright colors
+        self.start_btn = RoundedButton(text='START SHARING', font_size=dp(24), bold=True,
+                                      size_hint_y=None, height=dp(70),
+                                      bg_color=(0.15, 0.64, 0.41, 1))
+        self.start_btn.bind(on_press=self.start_sharing)
+        main.add_widget(self.start_btn)
 
-        # View Log button with better styling
-        log_btn = tk.Button(
-            bottom_frame,
-            text="📄 View Log",
-            font=tkfont.Font(family="Arial", size=16),
-            bg='#2a475e',
-            fg='#c7d5e0',
-            activebackground='#3d5a71',
-            activeforeground='white',
-            command=self.view_log,
-            relief='flat',
-            bd=0,
-            padx=20,
-            pady=10,
-            cursor='hand2'
-        )
-        log_btn.pack(side='left', padx=10)
-        log_btn.bind('<Enter>', lambda e: log_btn.config(bg='#3d5a71'))
-        log_btn.bind('<Leave>', lambda e: log_btn.config(bg='#2a475e'))
+        self.stop_btn = RoundedButton(text='STOP SHARING', font_size=dp(24), bold=True,
+                                     size_hint_y=None, height=dp(70),
+                                     bg_color=(0.75, 0.11, 0.16, 1), disabled=True)
+        self.stop_btn.bind(on_press=self.stop_sharing)
+        main.add_widget(self.stop_btn)
 
-        # Exit button with better styling
-        exit_btn = tk.Button(
-            bottom_frame,
-            text="✕ Exit",
-            font=tkfont.Font(family="Arial", size=16),
-            bg='#2a475e',
-            fg='#c7d5e0',
-            activebackground='#3d5a71',
-            activeforeground='white',
-            command=self.exit_app,
-            relief='flat',
-            bd=0,
-            padx=20,
-            pady=10,
-            cursor='hand2'
-        )
-        exit_btn.pack(side='left', padx=10)
-        exit_btn.bind('<Enter>', lambda e: exit_btn.config(bg='#3d5a71'))
-        exit_btn.bind('<Leave>', lambda e: exit_btn.config(bg='#2a475e'))
+        # Bottom buttons with better contrast
+        bottom = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(10))
 
-        # Bind escape key
-        self.root.bind('<Escape>', lambda e: self.exit_app())
+        log_btn = RoundedButton(text='VIEW LOG', font_size=dp(18),
+                               bg_color=(0.40, 0.40, 0.45, 1))
+        log_btn.bind(on_press=self.view_log)
+        bottom.add_widget(log_btn)
 
-    def get_local_ip(self):
-        """Get Deck's local IP address"""
+        exit_btn = RoundedButton(text='EXIT', font_size=dp(18),
+                                bg_color=(0.40, 0.40, 0.45, 1))
+        exit_btn.bind(on_press=self.exit_app)
+        bottom.add_widget(exit_btn)
+
+        main.add_widget(bottom)
+
+        root.add_widget(main)
+
+        # Bind touch event
+        Window.bind(on_touch_down=self.on_screen_tap)
+
+        # Start status checker
+        Clock.schedule_interval(self.check_status, 2)
+
+        return root
+
+    def get_local_ip(self) -> str:
+        """Get local IP address"""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(1)
@@ -225,191 +644,186 @@ class ControllerApp:
         except Exception:
             return "unknown"
 
-    def start_sharing(self):
+    def start_sharing(self, instance):
         """Start USB/IP sharing"""
         if self.sharing:
             return
 
-        self.status_indicator.config(fg='#f0ad4e')  # Orange
-        self.status_label.config(text="Starting...", fg='white')
-        self.start_btn.config(state='disabled')
-        self.root.update()
+        logger.info("Starting controller sharing...")
+        self.status_label.text = "STATUS: Starting..."
+        self.start_btn.disabled = True
 
-        try:
-            # Run start script silently in background
-            self.process = subprocess.Popen(
-                [str(START_SCRIPT)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+        # Run in thread to prevent UI freeze
+        Clock.schedule_once(lambda dt: self._do_start_sharing(), 0.1)
+
+    def _do_start_sharing(self):
+        """Actually perform the start operation"""
+        success, result = self.usbip.start_sharing()
+
+        if success:
+            self.sharing = True
+            self.status_label.text = "STATUS: Sharing Active"
+            self.status_label.color = (0.15, 0.64, 0.41, 1)  # Green
+
+            deck_ip = self.get_local_ip()
+            instructions = (
+                f"On your PC, run:\n\n"
+                f"  cd pc-scripts\n"
+                f"  ./pc-connect.sh {deck_ip}\n\n"
+                f"Or manually:\n"
+                f"  sudo usbip attach -r {deck_ip} -b {result}\n\n"
+                f"Use touchscreen to stop (buttons won't work!)\n"
+                f"Screen will dim in 10 seconds (tap to wake)..."
             )
+            self.instructions.text = instructions
 
-            # Check if it actually started successfully
-            self.root.after(3000, self.check_if_started)
+            self.start_btn.disabled = True
+            self.stop_btn.disabled = False
 
-        except Exception as e:
-            self.status_label.config(
-                text=f"❌ Error: {str(e)[:50]}",
-                fg='#cd5c5c'
-            )
-            self.start_btn.config(state='normal')
+            # Dim screen after 10 seconds, then turn off after 60 seconds
+            if self.dim_timer:
+                self.dim_timer.cancel()
+            self.dim_timer = Clock.schedule_once(lambda dt: self._dim_then_schedule_off(), 10)
+        else:
+            self.status_label.text = "STATUS: Failed to Start"
+            self.status_label.color = (0.75, 0.11, 0.16, 1)  # Red
+            self.instructions.text = f"Error: {result}\n\nCheck log for details."
+            self.start_btn.disabled = False
 
-    def check_if_started(self):
-        """Check if usbipd actually started"""
-        try:
-            result = subprocess.run(
-                ['pgrep', 'usbipd'],
-                capture_output=True
-            )
+    def _dim_then_schedule_off(self):
+        """Dim screen and schedule screen off after 1 minute"""
+        if self.sharing:
+            self.brightness.dim()
+            # Schedule screen off after 60 seconds
+            if self.screen_off_timer:
+                self.screen_off_timer.cancel()
+            self.screen_off_timer = Clock.schedule_once(lambda dt: self._turn_screen_off(), 60)
 
-            if result.returncode == 0:
-                # Success! usbipd is running
-                self.finish_start()
-            else:
-                # Failed to start - read last lines from log
-                try:
-                    with open('/tmp/steamdecky-controller.log', 'r') as f:
-                        lines = f.readlines()
-                        last_lines = ''.join(lines[-10:])  # Last 10 lines
-                except:
-                    last_lines = "Could not read log"
+    def _turn_screen_off(self):
+        """Turn screen off completely"""
+        if self.sharing:
+            self.brightness.screen_off()
 
-                self.status_indicator.config(fg='#cd5c5c')  # Red
-                self.status_label.config(
-                    text="Failed to Start",
-                    fg='white'
-                )
-                self.start_btn.config(state='normal')
-
-                self.instructions.config(
-                    text=f"Check log: /tmp/steamdecky-controller.log\n\n"
-                         f"Last lines:\n{last_lines[-200:]}"
-                )
-        except:
-            # Can't check, assume failed
-            self.start_btn.config(state='normal')
-
-    def finish_start(self):
-        """Update UI after starting"""
-        self.sharing = True
-        self.status_indicator.config(fg='#5c7e10')  # Green
-        self.status_label.config(
-            text="Sharing Active",
-            fg='white'
-        )
-
-        deck_ip = self.get_local_ip()
-        self.instructions.config(
-            text=f"On your PC, run:\n\n"
-                 f"  cd pc-scripts\n"
-                 f"  ./pc-connect.sh {deck_ip}\n\n"
-                 f"Use touchscreen to stop (buttons won't work!)"
-        )
-
-        self.start_btn.config(state='disabled')
-        self.stop_btn.config(state='normal')
-
-    def stop_sharing(self):
+    def stop_sharing(self, instance):
         """Stop USB/IP sharing"""
         if not self.sharing:
             return
 
-        self.status_indicator.config(fg='#f0ad4e')  # Orange
-        self.status_label.config(text="Stopping...", fg='white')
-        self.stop_btn.config(state='disabled')
-        self.root.update()
+        logger.info("Stopping controller sharing...")
+        self.status_label.text = "STATUS: Stopping..."
+        self.stop_btn.disabled = True
 
-        try:
-            # Kill the start script process if it's still running
-            if self.process:
-                try:
-                    self.process.terminate()
-                except:
-                    pass
+        Clock.schedule_once(lambda dt: self._do_stop_sharing(), 0.1)
 
-            # Run stop script silently
-            subprocess.Popen(
-                [str(STOP_SCRIPT)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+    def _do_stop_sharing(self):
+        """Actually perform the stop operation"""
+        success, message = self.usbip.stop_sharing()
 
-            # Give it a moment then check if stopped
-            self.root.after(2000, self.check_if_stopped)
+        self.sharing = False
+        self.status_label.text = "STATUS: Ready"
+        self.status_label.color = (0.91, 0.33, 0.13, 1)  # Orange
+        self.instructions.text = ""
 
-        except Exception as e:
-            self.status_label.config(
-                text=f"❌ Error: {str(e)[:50]}",
-                fg='#cd5c5c'
-            )
-            self.stop_btn.config(state='normal')
+        self.start_btn.disabled = False
+        self.stop_btn.disabled = True
 
-    def check_if_stopped(self):
-        """Check if usbipd actually stopped"""
-        try:
-            result = subprocess.run(
-                ['pgrep', 'usbipd'],
-                capture_output=True
-            )
+        # Restore brightness and cancel timers
+        self.brightness.restore()
+        if self.dim_timer:
+            self.dim_timer.cancel()
+            self.dim_timer = None
+        if self.screen_off_timer:
+            self.screen_off_timer.cancel()
+            self.screen_off_timer = None
 
-            if result.returncode != 0:
-                # Success! usbipd is not running
-                self.sharing = False
-                self.status_indicator.config(fg='#66c0f4')  # Blue (ready)
-                self.status_label.config(
-                    text="Ready",
-                    fg='white'
-                )
-                self.instructions.config(text="")
-                self.start_btn.config(state='normal')
-                self.stop_btn.config(state='disabled')
-            else:
-                # Still running - check terminal for issues
-                self.status_indicator.config(fg='#f0ad4e')  # Orange warning
-                self.status_label.config(
-                    text="Still Running - Check Log",
-                    fg='white'
-                )
-                self.stop_btn.config(state='normal')
-        except:
-            # Can't check, assume stopped
-            self.sharing = False
-            self.start_btn.config(state='normal')
-            self.stop_btn.config(state='disabled')
+    def on_screen_tap(self, window, touch):
+        """Handle screen tap - wake if dimmed or off"""
+        if (self.brightness.is_dimmed or self.brightness.is_off) and self.sharing:
+            self.brightness.restore()
 
-    def update_status(self):
-        """Check if usbipd is running"""
-        try:
-            result = subprocess.run(
-                ['pgrep', 'usbipd'],
-                capture_output=True
-            )
-            if result.returncode == 0 and not self.sharing:
-                # usbipd is running but we didn't start it
-                self.status_label.config(
-                    text="⚠ USB/IP may be active (started elsewhere)",
-                    fg='#f0ad4e'
-                )
-        except:
-            pass
+            # Cancel existing timers
+            if self.dim_timer:
+                self.dim_timer.cancel()
+            if self.screen_off_timer:
+                self.screen_off_timer.cancel()
 
-        # Check again in 2 seconds
-        self.root.after(2000, self.update_status)
+            # Re-dim after 10 seconds, then screen off after 1 minute
+            self.dim_timer = Clock.schedule_once(lambda dt: self._dim_then_schedule_off(), 10)
 
-    def view_log(self):
-        """Open log file in text editor"""
-        subprocess.Popen(['kate', '/tmp/steamdecky-controller.log'])
-
-    def exit_app(self):
-        """Exit the application"""
+    def check_status(self, dt):
+        """Periodically check USB/IP status and connected clients"""
         if self.sharing:
-            # Auto-stop if still sharing
-            self.stop_sharing()
-        self.root.destroy()
+            # Check if PC is connected
+            connected_clients = self.usbip.get_connected_clients()
+            if connected_clients > 0:
+                self.status_label.text = f"STATUS: PC Connected ({connected_clients})"
+                self.status_label.color = (0.15, 0.64, 0.41, 1)  # Green
+            else:
+                self.status_label.text = "STATUS: Waiting for PC..."
+                self.status_label.color = (0.91, 0.33, 0.13, 1)  # Orange
+        elif self.usbip.is_usbipd_running():
+            self.status_label.text = "STATUS: WARNING - USB/IP active"
+            self.status_label.color = (0.91, 0.33, 0.13, 1)  # Orange
+
+    def view_log(self, instance):
+        """Open log file in popup with scrollbar"""
+        popup = ModalView(size_hint=(0.9, 0.9))
+
+        layout = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(10))
+
+        title = Label(text='Application Log', font_size=dp(28), bold=True,
+                     size_hint_y=None, height=dp(50))
+        layout.add_widget(title)
+
+        # Log content with scrollbar
+        scroll = ScrollView(size_hint=(1, 1), bar_width=dp(15), bar_color=(0.91, 0.33, 0.13, 1))
+        log_text = TextInput(readonly=True, font_size=dp(14), size_hint_y=None)
+        log_text.bind(minimum_height=log_text.setter('height'))
+
+        try:
+            with open(LOG_FILE, 'r') as f:
+                log_text.text = f.read()
+        except Exception as e:
+            log_text.text = f"Error loading log file: {e}"
+
+        scroll.add_widget(log_text)
+        layout.add_widget(scroll)
+
+        close_btn = RoundedButton(text='CLOSE', font_size=dp(22), size_hint_y=None, height=dp(70),
+                                 bg_color=(0.91, 0.33, 0.13, 1))
+        close_btn.bind(on_press=popup.dismiss)
+        layout.add_widget(close_btn)
+
+        popup.add_widget(layout)
+        popup.open()
+
+    def exit_app(self, instance):
+        """Exit application"""
+        logger.info("Exiting application...")
+
+        if self.sharing:
+            self.usbip.stop_sharing()
+
+        # Force brightness restore
+        if self.brightness.original_brightness:
+            self.brightness.set_brightness(self.brightness.original_brightness)
+        self.brightness.is_dimmed = False
+        self.brightness.is_off = False
+
+        self.stop()
+
 
 def main():
-    root = tk.Tk()
-    app = ControllerApp(root)
-    root.mainloop()
+    """Main entry point"""
+    logger.info("=" * 50)
+    logger.info("Steamy Controller - Starting")
+    logger.info(f"Log file: {LOG_FILE}")
+    logger.info("=" * 50)
+
+    ControllerApp().run()
+
+    logger.info("Application closed")
+
 
 if __name__ == '__main__':
     main()
