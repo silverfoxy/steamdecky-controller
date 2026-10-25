@@ -2,12 +2,14 @@
 
 **Share your Steam Deck controller wirelessly over the network**
 
-A beautiful, modern GUI app for sharing your Steam Deck's built-in controller to your PC using USB/IP. Features automatic PC connection detection, screen dimming, and a touch-friendly interface.
+A beautiful, modern GUI app for sharing your Steam Deck's built-in controller to your PC using USB/IP. Features automatic PC connection detection, sleep prevention while sharing, screen dimming, and a touch-friendly interface.
 
 ## Features
 
 - **Share controller over network** - Use your Deck's controls on your PC
 - **PC connection detection** - Automatically detects when your PC connects
+- **PC auto-discovery** - Linux client finds an actively sharing Deck via mDNS (Avahi)
+- **Sleep prevention while sharing** - Rechecks and restores the idle/sleep inhibitor if it exits
 
 ## Prerequisites
 
@@ -48,13 +50,19 @@ A beautiful, modern GUI app for sharing your Steam Deck's built-in controller to
    sudo modprobe usbip-core  # Should not ask for password
    ```
 
+3. **Optional auto-discovery:** Install `avahi-publish-service` and run `avahi-daemon` on the Deck. The app advertises `_steamy-controller._tcp` on port 3240 only while sharing. If unavailable, the displayed IP and bus ID still work with the manual client command. Discovery needs mDNS (UDP 5353) permitted on the local network.
+
+4. **Sleep prevention:** The app requires `systemd-inhibit` and `sleep` to hold an idle/sleep block during sharing. It retries if the inhibitor exits and shows a warning if it cannot hold the block; screen dimming is separate from suspend prevention.
+
 ### PC Setup
 
-Install USB/IP tools:
+Install USB/IP tools and Avahi on the Linux PC (plus Python 3 for the discovery parser):
 
-- **Ubuntu/Debian:** `sudo apt install linux-tools-generic`
-- **Fedora:** `sudo dnf install usbip`
-- **Arch:** `sudo pacman -S usbip`
+- **Ubuntu/Debian:** `sudo apt install linux-tools-generic avahi-utils`
+- **Fedora:** `sudo dnf install usbip avahi-tools`
+- **Arch:** `sudo pacman -S usbip avahi`
+
+Ensure `avahi-daemon` is running. If mDNS is unavailable, pass the Deck IP and displayed bus ID explicitly instead.
 
 ## Quick Start
 
@@ -76,8 +84,10 @@ Install USB/IP tools:
 
 ```bash
 cd pc-scripts
-./pc-connect.sh <deck-ip>
+./pc-connect.sh
 ```
+
+The client selects the one advertised Deck and checks the advertised USB bus ID against the exported Valve controller before attaching. If more than one Deck is found, it refuses to guess; use `./pc-connect.sh <deck-ip> <busid>`. This also works when Avahi/mDNS is unavailable. Discovery is for convenience, **not authentication**: use USB/IP only on a trusted network.
 
 Status changes to **"PC Connected"** (green) ✅
 
@@ -85,9 +95,9 @@ Status changes to **"PC Connected"** (green) ✅
 
 Use **touchscreen** to tap **STOP SHARING** button
 
-- Controller restored to Deck
+- Controller restored to Deck (the app will keep the sleep lock and offer a retry if restore fails)
 - Screen brightness restored
-- Status returns to **"Ready"**
+- Status returns to **"Ready"** only after successful restoration. The app leaves `usbipd` running because another USB/IP export may use it; the controller itself is no longer exported. USB/IP has no built-in authentication, so restrict port 3240 to trusted hosts/networks.
 
 ## How It Works
 
@@ -96,6 +106,7 @@ Use **touchscreen** to tap **STOP SHARING** button
 3. **Auto Screen Management:**
    - Screen dims after 10 seconds
    - Tap screen to wake
+   - Idle suspend and idle display sleep are blocked while sharing is active
 4. **Stop Sharing** - Controller rebinds to Deck, everything restored
 
 ## Important Notes
@@ -136,6 +147,8 @@ When sharing is active:
 ### Screen Behavior
 
 - **Dims after 10 seconds** - Tap screen to wake
+- **Deck stays awake while sharing** - The controller is unavailable to Steam Input
+  during USB/IP sharing, so the app blocks idle sleep until you stop sharing
 - **Auto-restores on exit** - Brightness returns to normal
 
 ### Network Requirements
@@ -165,7 +178,7 @@ which usbip  # Should show /home/deck/.nix-profile/bin/usbip
 
 ### App won't start
 
-Make sure you're using system Python with tkinter:
+Make sure you're using a Python environment with working Kivy native modules; the app does **not** use tkinter. This repository's `lib/` contains Python sources but may not include compiled Kivy extensions for every system. If `kivy._clock` is missing, install a matching Kivy build for your Python interpreter. Then launch:
 
 ```bash
 /usr/bin/python3 deck-controller-gui.py
@@ -202,6 +215,7 @@ sudo killall usbipd
 ```
 steamdecky-controller/
 ├── deck-controller-gui.py    # Main Kivy app
+├── deck_services.py          # Avahi publication and sleep inhibitor lifecycle
 ├── background.webp           # Custom background image
 ├── lib/                      # Python dependencies (self-contained)
 │   ├── kivy/                # Modern touch UI framework
@@ -209,8 +223,9 @@ steamdecky-controller/
 │   ├── filetype/
 │   └── packaging/
 ├── pc-scripts/
-│   ├── pc-connect.sh        # Connect from PC
-│   └── pc-disconnect.sh     # Disconnect from PC
+│   ├── discover_deck.py      # Parse resolved Avahi service records
+│   ├── pc-connect.sh         # Discover/connect from Linux PC
+│   └── pc-disconnect.sh      # Disconnect from PC
 └── README.md
 ```
 

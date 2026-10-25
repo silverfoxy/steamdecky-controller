@@ -15,19 +15,25 @@ if ! command -v usbip &> /dev/null; then
     exit 1
 fi
 
-# Get Deck IP
-if [ -z "$1" ]; then
-    echo "Usage: $0 <deck-ip> [busid]"
-    echo
-    echo "Example: $0 192.168.1.206 3-3"
-    echo
-    echo "To find available devices:"
-    echo "  usbip list -r <deck-ip>"
-    exit 1
+# Without arguments discover the actively sharing Deck via mDNS/Avahi.
+# Explicit IP and bus ID remain available if multicast discovery is blocked.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [ "$#" -eq 0 ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "ERROR: python3 is required for automatic discovery" >&2
+        exit 1
+    fi
+    DISCOVERY=$(python3 "$SCRIPT_DIR/discover_deck.py") || exit 1
+    IFS=$'\t' read -r DECK_IP BUSID <<< "$DISCOVERY"
+else
+    DECK_IP=$1
+    BUSID=${2:-"3-3"}  # Legacy manual default; pass the Deck's displayed bus ID if different.
 fi
 
-DECK_IP=$1
-BUSID=${2:-"3-3"}  # Default busid for Steam Deck controller
+if [[ ! $BUSID =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]]; then
+    echo "ERROR: Invalid USB bus ID: $BUSID" >&2
+    exit 1
+fi
 
 echo "Deck IP: $DECK_IP"
 echo "Bus ID: $BUSID"
@@ -54,10 +60,21 @@ echo
 echo "Loading USB/IP kernel modules..."
 sudo modprobe vhci-hcd
 
-# List available devices
-echo "Available devices on Deck:"
-usbip list -r "$DECK_IP"
-echo
+# Confirm that the selected bus ID is actually the Steam Deck controller.
+# An mDNS TXT record is not proof; do not attach an unrelated USB device.
+if ! REMOTE_DEVICES=$(usbip list -r "$DECK_IP"); then
+    echo "ERROR: Could not list USB/IP devices on $DECK_IP" >&2
+    exit 1
+fi
+printf '%s\n' "$REMOTE_DEVICES"
+if ! printf '%s\n' "$REMOTE_DEVICES" | awk -v busid="$BUSID" '
+    { line = $0; sub(/^[[:space:]]*-?[[:space:]]*/, "", line) }
+    index(line, busid ":") == 1 && tolower(line) ~ /\(28de:1205\)/ { found = 1 }
+    END { exit !found }
+'; then
+    echo "ERROR: $BUSID on $DECK_IP is not an exported Steam Deck controller" >&2
+    exit 1
+fi
 
 # Attach the device
 echo "Attaching controller..."
