@@ -4,6 +4,7 @@ import ast
 import subprocess
 from pathlib import Path
 from unittest.mock import Mock
+from unittest.mock import patch
 
 
 TREE = ast.parse((Path(__file__).resolve().parents[1] / 'deck-controller-gui.py').read_text())
@@ -16,6 +17,22 @@ def method(class_name, name, **globals_):
     exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
                  '<extracted-app-method>', 'exec'), scope)
     return scope[name]
+
+
+def test_usbip_profile_symlinks_resolve_to_authorized_binaries(tmp_path):
+    store = tmp_path / 'store' / 'bin'
+    store.mkdir(parents=True)
+    for name in ('usbip', 'usbipd'):
+        (store / name).touch()
+    profile = tmp_path / '.nix-profile' / 'bin'
+    profile.parent.mkdir()
+    profile.symlink_to(store, target_is_directory=True)
+    with patch.object(Path, 'home', return_value=tmp_path):
+        binary = method('USBIPController', 'find_usbip', Path=Path, Optional=str)(Mock())
+    assert binary == str(store / 'usbip')
+    daemon = method('USBIPController', 'find_usbipd', Path=Path, Optional=str)(
+        Mock(usbip_path=binary))
+    assert daemon == str(store / 'usbipd')
 
 
 def test_stop_only_unbinds_this_apps_device():

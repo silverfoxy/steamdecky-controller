@@ -70,7 +70,11 @@ class USBIPController:
         ]
 
         for path in candidates:
+            path = Path(path)
             if path.exists():
+                # Scoped sudo rules authorize the immutable Nix store path.
+                # sudo may reject the profile symlink even for the same binary.
+                path = path.resolve()
                 logger.info(f"Found usbip at: {path}")
                 return str(path)
 
@@ -82,7 +86,7 @@ class USBIPController:
         if self.usbip_path:
             usbipd = Path(self.usbip_path).parent / "usbipd"
             if usbipd.exists():
-                return str(usbipd)
+                return str(usbipd.resolve())
         return None
 
     def clean_environment(self):
