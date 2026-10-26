@@ -106,3 +106,44 @@ def test_window_close_failure_does_not_release_inhibitor():
     method('ControllerApp', 'on_stop')(app)
     app.sleep_inhibitor.stop.assert_not_called()
     app.brightness.restore.assert_called_once()
+
+
+def test_idle_dimming_never_switches_display_off():
+    app = Mock(sharing=True)
+    clock = Mock()
+    method('ControllerApp', '_dim_then_schedule_off', Clock=clock)(app)
+    app.brightness.dim.assert_called_once()
+    app.brightness.screen_off.assert_not_called()
+    clock.schedule_once.assert_not_called()
+    assert app.dim_timer is None
+
+
+def test_wake_redraws_even_when_app_did_not_dim_display():
+    app = Mock(sharing=True, restore_error=None)
+    window, clock = Mock(), Mock()
+    dim_timer, off_timer = app.dim_timer, app.screen_off_timer
+    method('ControllerApp', 'wake_screen', Window=window, Clock=clock)(app)
+    app.brightness.restore.assert_called_once()
+    app.root.canvas.ask_update.assert_called_once()
+    window.canvas.ask_update.assert_called_once()
+    dim_timer.cancel.assert_called_once()
+    off_timer.cancel.assert_called_once()
+    assert app.screen_off_timer is None
+    clock.schedule_once.assert_called_once()
+
+
+def test_focus_recovery_only_runs_on_focus_gain():
+    app = Mock()
+    focus = method('ControllerApp', 'on_window_focus')
+    focus(app, None, False)
+    app.wake_screen.assert_not_called()
+    focus(app, None, True)
+    app.wake_screen.assert_called_once()
+
+
+def test_restore_failure_stays_visible_after_touch():
+    app = Mock(sharing=True, restore_error='retry required')
+    clock = Mock()
+    method('ControllerApp', 'wake_screen', Window=Mock(), Clock=clock)(app)
+    app.brightness.restore.assert_called_once()
+    clock.schedule_once.assert_not_called()

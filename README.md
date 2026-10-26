@@ -146,7 +146,9 @@ When sharing is active:
 
 ### Screen Behavior
 
-- **Dims after 10 seconds** - Tap screen to wake
+- **Dims after 10 seconds** - Tap screen to restore brightness. The app keeps the
+  display at a visible brightness instead of turning it off, so STOP and EXIT remain
+  accessible. Touching or returning to the app also requests a redraw.
 - **Deck stays awake while sharing** - The controller is unavailable to Steam Input
   during USB/IP sharing, so the app blocks idle sleep until you stop sharing
 - **Auto-restores on exit** - Brightness returns to normal

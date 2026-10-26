@@ -598,6 +598,7 @@ class ControllerApp(App):
         # Bind touch event
         Window.bind(on_touch_down=self.on_screen_tap)
         Window.bind(on_request_close=self.on_request_close)
+        Window.bind(focus=self.on_window_focus, on_restore=self.wake_screen)
 
         # Start status checker
         Clock.schedule_interval(self.check_status, 2)
@@ -655,7 +656,7 @@ class ControllerApp(App):
             self.start_btn.disabled = True
             self.stop_btn.disabled = False
 
-            # Dim screen after 10 seconds, then turn off after 60 seconds
+            # Dim without switching off the display: touch controls must stay accessible.
             if self.dim_timer:
                 self.dim_timer.cancel()
             self.dim_timer = Clock.schedule_once(lambda dt: self._dim_then_schedule_off(), 10)
@@ -666,18 +667,10 @@ class ControllerApp(App):
             self.start_btn.disabled = False
 
     def _dim_then_schedule_off(self):
-        """Dim screen and schedule screen off after 1 minute"""
+        """Keep the display dimmed but visible so STOP and EXIT stay accessible."""
+        self.dim_timer = None
         if self.sharing:
             self.brightness.dim()
-            # Schedule screen off after 60 seconds
-            if self.screen_off_timer:
-                self.screen_off_timer.cancel()
-            self.screen_off_timer = Clock.schedule_once(lambda dt: self._turn_screen_off(), 60)
-
-    def _turn_screen_off(self):
-        """Turn screen off completely"""
-        if self.sharing:
-            self.brightness.screen_off()
 
     def stop_sharing(self, instance):
         """Stop USB/IP sharing"""
@@ -730,19 +723,29 @@ class ControllerApp(App):
             self.screen_off_timer.cancel()
             self.screen_off_timer = None
 
+    def wake_screen(self, *args):
+        """Restore brightness and redraw after touch or window restoration."""
+        self.brightness.restore()
+        if self.dim_timer:
+            self.dim_timer.cancel()
+            self.dim_timer = None
+        if self.screen_off_timer:
+            self.screen_off_timer.cancel()
+            self.screen_off_timer = None
+        if self.root:
+            self.root.canvas.ask_update()
+        Window.canvas.ask_update()
+        if self.sharing and not self.restore_error:
+            self.dim_timer = Clock.schedule_once(
+                lambda dt: self._dim_then_schedule_off(), 10)
+
+    def on_window_focus(self, window, focused):
+        if focused:
+            self.wake_screen()
+
     def on_screen_tap(self, window, touch):
-        """Handle screen tap - wake if dimmed or off"""
-        if (self.brightness.is_dimmed or self.brightness.is_off) and self.sharing:
-            self.brightness.restore()
-
-            # Cancel existing timers
-            if self.dim_timer:
-                self.dim_timer.cancel()
-            if self.screen_off_timer:
-                self.screen_off_timer.cancel()
-
-            # Re-dim after 10 seconds, then screen off after 1 minute
-            self.dim_timer = Clock.schedule_once(lambda dt: self._dim_then_schedule_off(), 10)
+        """Wake on every tap, including when the compositor blanked the screen."""
+        self.wake_screen()
 
     def check_status(self, dt):
         """Periodically check USB/IP status and connected clients"""
