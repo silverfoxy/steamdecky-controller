@@ -1,0 +1,13 @@
+{
+	"custom/controller": {
+		"exec": "/home/silverfoxy/Documents/personal/steamdecky-controller/pc-scripts/controller-waybar.sh status",
+		"return-type": "json",
+		"interval": 3,
+		"signal": 9,
+		"format": "{}",
+		"escape": false,
+		"min-length": 3,
+		"max-length": 4,
+		"on-click": "/home/silverfoxy/Documents/personal/steamdecky-controller/pc-scripts/controller-waybar.sh menu"
+	}
+}

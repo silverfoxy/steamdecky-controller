@@ -56,9 +56,15 @@ echo
 # TL;DR: start Steam on this PC before (or after) running this script,
 # otherwise only basic keyboard/mouse emulation will work.
 
+# Waybar must fail with a useful error instead of opening a password dialog.
+privilege=(sudo)
+if [[ ${STEAM_DECK_NONINTERACTIVE:-0} == 1 ]]; then
+    privilege+=(-n)
+fi
+
 # Load kernel modules
 echo "Loading USB/IP kernel modules..."
-sudo modprobe vhci-hcd
+"${privilege[@]}" modprobe vhci-hcd || exit 1
 
 # Confirm that the selected bus ID is actually the Steam Deck controller.
 # An mDNS TXT record is not proof; do not attach an unrelated USB device.
@@ -78,7 +84,7 @@ fi
 
 # Attach the device
 echo "Attaching controller..."
-sudo usbip attach -r "$DECK_IP" -b "$BUSID"
+"${privilege[@]}" usbip attach -r "$DECK_IP" -b "$BUSID"
 
 if [ $? -eq 0 ]; then
     echo

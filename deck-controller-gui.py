@@ -603,7 +603,17 @@ class ControllerApp(App):
         # Start status checker
         Clock.schedule_interval(self.check_status, 2)
 
+        # Keep submitting frames to Gamescope even when the status is unchanged.
+        # A one-shot redraw on touch can precede the compositor's wake-up.
+        self.redraw_timer = Clock.schedule_interval(self.refresh_window, 1 / 30)
+
         return root
+
+    def refresh_window(self, dt):
+        """Keep the static UI available across dimming and compositor wake-up."""
+        if self.root:
+            self.root.canvas.ask_update()
+        Window.canvas.ask_update()
 
     def get_local_ip(self) -> str:
         """Get local IP address"""
@@ -828,6 +838,9 @@ class ControllerApp(App):
                 else:
                     logger.error('Controller still exported on exit: %s', message)
         finally:
+            redraw_timer = getattr(self, 'redraw_timer', None)
+            if redraw_timer is not None:
+                redraw_timer.cancel()
             if hasattr(self, 'discovery'):
                 self.discovery.stop()
             if hasattr(self, 'sleep_inhibitor'):

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <object class="GtkMenu" id="menu">
+    <child>
+      <object class="GtkMenuItem" id="connect">
+        <property name="label">Connect Steam Deck controller</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="disconnect">
+        <property name="label">Disconnect Steam Deck controller</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkSeparatorMenuItem" id="separator1"/>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="bridge-start">
+        <property name="label">Start Wayland pointer bridge</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="bridge-stop">
+        <property name="label">Stop Wayland pointer bridge</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="bridge-restart">
+        <property name="label">Restart Wayland pointer bridge</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkSeparatorMenuItem" id="separator2"/>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="refresh">
+        <property name="label">Refresh status</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="log">
+        <property name="label">Open bridge log</property>
+      </object>
+    </child>
+  </object>
+</interface>
